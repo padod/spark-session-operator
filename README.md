@@ -171,6 +171,30 @@ Or apply a session CR directly (for automation):
 kubectl apply -f config/samples/session.yaml
 ```
 
+When creating sessions via `kubectl apply`, you don't need Keycloak or the proxy — connect directly to the backend. First, get the session endpoint:
+
+```sh
+kubectl get sparkinteractivesession <session-name> -n spark-dev -o jsonpath='{.status.endpoint}'
+```
+
+Then port-forward to the assigned instance:
+
+```sh
+kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 15002:15002
+```
+
+And connect with PySpark without credentials:
+
+```python
+from pyspark.sql import SparkSession
+
+spark = SparkSession.builder \
+    .remote("sc://localhost:15002") \
+    .getOrCreate()
+
+spark.sql("SELECT 1").show()
+```
+
 ## Configuration
 
 The operator accepts the following command-line flags:
