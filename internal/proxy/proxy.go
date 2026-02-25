@@ -446,7 +446,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	// Use ForceCodec (not CallContentSubtype) so the content-type stays as
 	// "application/grpc" which the backend Spark Connect server expects,
 	// while still using raw byte passthrough for marshal/unmarshal.
-	backendConn, err := grpc.NewClient("dns:///"+endpoint,
+	backendConn, err := grpc.NewClient("passthrough:///"+endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
 	)
