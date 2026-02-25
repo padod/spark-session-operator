@@ -38,10 +38,10 @@ import (
 )
 
 const (
-	sessionPollInterval    = 500 * time.Millisecond
-	sessionPollTimeout     = 60 * time.Second
-	keepaliveInterval      = 2 * time.Minute
-	backendDialTimeout     = 10 * time.Second
+	sessionPollInterval = 500 * time.Millisecond
+	sessionPollTimeout  = 60 * time.Second
+	keepaliveInterval   = 2 * time.Minute
+	backendDialTimeout  = 10 * time.Second
 )
 
 // SessionProxy handles incoming Thrift and gRPC connections, auto-creating sessions
