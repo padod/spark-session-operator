@@ -1,7 +1,7 @@
 apiVersion: sparkinteractive.io/v1alpha1
 kind: SparkSessionPool
 metadata:
-  name: thrift-pool
+  name: thrift-default-pool
   namespace: spark-dev
 spec:
   type: thrift
