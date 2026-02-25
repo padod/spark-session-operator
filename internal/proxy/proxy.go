@@ -30,7 +30,6 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/encoding"
 	"google.golang.org/grpc/status"
 
 	sparkv1alpha1 "github.com/tander/spark-session-operator/api/v1alpha1"
@@ -298,9 +297,10 @@ func (p *SessionProxy) StartConnectProxy(addr string) error {
 		return fmt.Errorf("listen on %s: %w", addr, err)
 	}
 
-	encoding.RegisterCodec(rawCodec{})
-
-	server := grpc.NewServer(grpc.UnknownServiceHandler(p.handleConnectStream))
+	server := grpc.NewServer(
+		grpc.ForceServerCodec(rawCodec{}),
+		grpc.UnknownServiceHandler(p.handleConnectStream),
+	)
 
 	p.log.Info("Starting Connect gRPC proxy", "addr", addr)
 
