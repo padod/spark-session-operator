@@ -317,14 +317,33 @@ func (p *SessionProxy) StartConnectProxy(addr string) error {
 func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.ServerStream) error {
 	ctx := serverStream.Context()
 
-	// 1. Extract credentials from gRPC metadata
-	username, password, err := extractCredentialsFromGRPCMetadata(ctx)
-	if err != nil {
-		p.log.Error(err, "gRPC metadata extraction failed")
-		return status.Errorf(codes.Unauthenticated, "missing credentials: %v", err)
+	var username, password string
+	var firstMsg *rawFrame
+
+	// 1. Try gRPC metadata auth first (works on TLS channels)
+	username, password, metaErr := extractCredentialsFromGRPCMetadata(ctx)
+	if metaErr != nil {
+		// 2. Fall back: read the first protobuf message and extract user_context.user_id.
+		//    On insecure channels PySpark cannot send gRPC metadata credentials,
+		//    but user_id is always embedded in the protobuf request body.
+		//    Users set it via: sc://host:port/;user_id=base64(user:pass)
+		//    or:               sc://host:port/;user_id=username
+		firstMsg = &rawFrame{}
+		if err := serverStream.RecvMsg(firstMsg); err != nil {
+			p.log.Error(err, "Failed to read first gRPC message")
+			return status.Errorf(codes.Internal, "failed to read request: %v", err)
+		}
+
+		var protoErr error
+		username, password, protoErr = extractCredentialsFromProto(firstMsg.payload)
+		if protoErr != nil {
+			p.log.Error(protoErr, "Failed to extract credentials from protobuf")
+			return status.Errorf(codes.Unauthenticated,
+				"missing credentials: set user_id in sc:// URL, e.g. sc://host:port/;user_id=base64(user:pass)")
+		}
 	}
 
-	// 2. Authenticate via Keycloak ROPC
+	// 3. Authenticate via Keycloak ROPC (or skip-validation)
 	userInfo, err := p.auth.AuthenticateWithCredentials(ctx, username, password)
 	if err != nil {
 		p.log.Error(err, "Credential authentication failed", "user", username)
@@ -333,28 +352,28 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 
 	p.log.Info("Connect user authenticated", "user", userInfo.Username)
 
-	// 3. Find pool
+	// 4. Find pool
 	poolName, err := p.findPool(ctx, "connect")
 	if err != nil {
 		p.log.Error(err, "Failed to find connect pool", "user", userInfo.Username)
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 
-	// 4. Create session
+	// 5. Create session
 	sessionName, err := p.createSession(ctx, userInfo.Username, poolName)
 	if err != nil {
 		p.log.Error(err, "Failed to create session", "user", userInfo.Username, "pool", poolName)
 		return status.Errorf(codes.Internal, "failed to create session")
 	}
 
-	// 5. Wait for session to become active
+	// 6. Wait for session to become active
 	endpoint, err := p.waitForSessionActive(ctx, sessionName)
 	if err != nil {
 		p.log.Error(err, "Session did not become active", "session", sessionName)
 		return status.Errorf(codes.Unavailable, "session failed to start")
 	}
 
-	// 6. Connect to backend gRPC server
+	// 7. Connect to backend gRPC server
 	backendConn, err := grpc.NewClient(endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.CallContentSubtype("raw")),
@@ -371,7 +390,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 		return status.Errorf(codes.Internal, "failed to get method name")
 	}
 
-	// 7. Create backend client stream
+	// 8. Create backend client stream
 	backendCtx, backendCancel := context.WithCancel(ctx)
 	defer backendCancel()
 
@@ -385,6 +404,14 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	}
 
 	p.log.Info("Connect session proxying started", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint, "method", fullMethod)
+
+	// 9. If we consumed the first message for auth, forward it to the backend now
+	if firstMsg != nil {
+		if err := backendStream.SendMsg(firstMsg); err != nil {
+			p.log.Error(err, "Failed to forward first message to backend", "session", sessionName)
+			return status.Errorf(codes.Unavailable, "failed to forward request to backend")
+		}
+	}
 
 	// Start keepalive
 	keepaliveCtx, keepaliveCancel := context.WithCancel(context.Background())
