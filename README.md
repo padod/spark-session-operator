@@ -177,10 +177,14 @@ When creating sessions via `kubectl apply`, you don't need Keycloak or the proxy
 kubectl get sparkinteractivesession <session-name> -n spark-dev -o jsonpath='{.status.endpoint}'
 ```
 
-Then port-forward to the assigned instance:
+Then port-forward to the assigned instance (Spark Connect listens on port 8424 inside the pod, Thrift on 8972):
 
 ```sh
-kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 15002:15002
+# Spark Connect
+kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 15002:8424
+
+# Spark Thrift Server
+kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 10009:8972
 ```
 
 And connect with PySpark without credentials:

@@ -42,7 +42,7 @@ type OIDCConfig struct {
 	UserClaim string
 	// GroupsClaim is the JWT claim containing user groups (default "groups")
 	GroupsClaim string
-	// SkipValidation disables token signature verification (dev only)
+	// SkipValidation bypasses Keycloak ROPC entirely, trusting the provided username (dev only)
 	SkipValidation bool
 }
 
@@ -64,7 +64,15 @@ func NewAuthenticator(cfg OIDCConfig) *Authenticator {
 
 // AuthenticateWithCredentials exchanges username/password for a JWT via Keycloak ROPC,
 // then extracts UserInfo from the JWT claims. Used by the proxy.
+// When SkipValidation is true, bypasses Keycloak entirely and trusts the provided username (dev only).
 func (a *Authenticator) AuthenticateWithCredentials(ctx context.Context, username, password string) (*UserInfo, error) {
+	if a.Config.SkipValidation {
+		if username == "" {
+			return nil, fmt.Errorf("username is required even in skip-validation mode")
+		}
+		return &UserInfo{Username: username}, nil
+	}
+
 	tokenURL := strings.TrimRight(a.Config.IssuerURL, "/") + "/protocol/openid-connect/token"
 
 	data := url.Values{
@@ -112,13 +120,9 @@ func (a *Authenticator) AuthenticateWithCredentials(ctx context.Context, usernam
 }
 
 // ValidateToken parses a JWT and extracts UserInfo.
-// Both SkipValidation and normal paths use ParseUnverified (production JWKS validation is a separate TODO).
+// TODO: add JWKS signature verification for production use.
 func (a *Authenticator) ValidateToken(tokenString string) (*UserInfo, error) {
 	parser := jwt.NewParser()
-	if a.Config.SkipValidation {
-		parser = jwt.NewParser(jwt.WithoutClaimsValidation())
-	}
-
 	token, _, err := parser.ParseUnverified(tokenString, jwt.MapClaims{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse token: %w", err)
