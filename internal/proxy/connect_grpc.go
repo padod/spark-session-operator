@@ -223,7 +223,10 @@ func (rawCodec) Unmarshal(data []byte, v interface{}) error {
 	return nil
 }
 
-func (rawCodec) Name() string { return "raw" }
+// Name returns "proto" so that gRPC sets the standard content-type
+// (application/grpc or application/grpc+proto) when proxying to the backend.
+// The codec itself just passes raw bytes through without marshaling.
+func (rawCodec) Name() string { return "proto" }
 
 // rawFrame holds raw bytes for transparent gRPC proxying.
 type rawFrame struct {

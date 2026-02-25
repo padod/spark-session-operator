@@ -22,6 +22,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -51,6 +52,10 @@ type SessionProxy struct {
 	log       logr.Logger
 	namespace string
 	auth      *auth.Authenticator
+
+	// sessions tracks user+pool → session name to avoid races
+	// when multiple RPCs arrive before the informer cache updates.
+	sessions sync.Map // key: "user:pool", value: string (session name)
 }
 
 // NewSessionProxy creates a new proxy.
@@ -87,6 +92,66 @@ func (p *SessionProxy) findPool(ctx context.Context, poolType string) (string, e
 		return "", fmt.Errorf("found %d pools of type %q in namespace %s (expected exactly 1): %v",
 			len(matches), poolType, p.namespace, matches)
 	}
+}
+
+// sessionKey returns the map key for session tracking.
+func sessionKey(username, poolName string) string {
+	return username + ":" + poolName
+}
+
+// findOrCreateSession returns an existing active/idle session for the user in the pool,
+// or creates a new one if none exists. Uses an in-memory map to prevent races when
+// multiple RPCs arrive before the informer cache reflects the newly created session.
+func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolName string) (string, error) {
+	key := sessionKey(username, poolName)
+
+	// 1. Check in-memory cache first (handles concurrent RPCs).
+	if cached, ok := p.sessions.Load(key); ok {
+		name := cached.(string)
+		// Validate the session still exists and is usable.
+		session := &sparkv1alpha1.SparkInteractiveSession{}
+		if err := p.client.Get(ctx, client.ObjectKey{
+			Namespace: p.namespace,
+			Name:      name,
+		}, session); err == nil {
+			switch session.Status.State {
+			case "Active", "Idle", "Pending", "Assigning", "":
+				p.log.Info("Reusing session (cached)", "name", name, "user", username, "state", session.Status.State)
+				return name, nil
+			}
+		}
+		// Cached session is gone or failed — remove from cache.
+		p.sessions.Delete(key)
+	}
+
+	// 2. Check the informer cache for existing sessions.
+	sessionList := &sparkv1alpha1.SparkInteractiveSessionList{}
+	if err := p.client.List(ctx, sessionList,
+		client.InNamespace(p.namespace),
+		client.MatchingLabels{
+			"sparkinteractive.io/user": username,
+			"sparkinteractive.io/pool": poolName,
+		},
+	); err != nil {
+		return "", fmt.Errorf("list sessions: %w", err)
+	}
+
+	for _, s := range sessionList.Items {
+		switch s.Status.State {
+		case "Active", "Idle", "Pending", "Assigning":
+			p.log.Info("Reusing session (discovered)", "name", s.Name, "user", username, "state", s.Status.State)
+			p.sessions.Store(key, s.Name)
+			return s.Name, nil
+		}
+	}
+
+	// 3. No reusable session — create a new one and cache it.
+	name, err := p.createSession(ctx, username, poolName)
+	if err != nil {
+		return "", err
+	}
+	p.sessions.Store(key, name)
+	return name, nil
 }
 
 // createSession creates a SparkInteractiveSession CR for the user.
@@ -237,10 +302,10 @@ func (p *SessionProxy) handleThriftConnection(clientConn net.Conn) {
 		return
 	}
 
-	// 4. Create session
-	sessionName, err := p.createSession(ctx, userInfo.Username, poolName)
+	// 4. Find existing or create new session
+	sessionName, err := p.findOrCreateSession(ctx, userInfo.Username, poolName)
 	if err != nil {
-		p.log.Error(err, "Failed to create session", "user", userInfo.Username, "pool", poolName)
+		p.log.Error(err, "Failed to find/create session", "user", userInfo.Username, "pool", poolName)
 		_ = writeSASLFrame(clientConn, saslERROR, []byte("failed to create session"))
 		return
 	}
@@ -363,10 +428,10 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 		return status.Errorf(codes.FailedPrecondition, "%v", err)
 	}
 
-	// 5. Create session
-	sessionName, err := p.createSession(ctx, userInfo.Username, poolName)
+	// 5. Find existing or create new session
+	sessionName, err := p.findOrCreateSession(ctx, userInfo.Username, poolName)
 	if err != nil {
-		p.log.Error(err, "Failed to create session", "user", userInfo.Username, "pool", poolName)
+		p.log.Error(err, "Failed to find/create session", "user", userInfo.Username, "pool", poolName)
 		return status.Errorf(codes.Internal, "failed to create session")
 	}
 
@@ -378,9 +443,12 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	}
 
 	// 7. Connect to backend gRPC server
+	// Use ForceCodec (not CallContentSubtype) so the content-type stays as
+	// "application/grpc" which the backend Spark Connect server expects,
+	// while still using raw byte passthrough for marshal/unmarshal.
 	backendConn, err := grpc.NewClient(endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.CallContentSubtype("raw")),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
 	)
 	if err != nil {
 		p.log.Error(err, "Failed to connect to backend", "endpoint", endpoint, "session", sessionName)
@@ -401,7 +469,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	backendStream, err := backendConn.NewStream(backendCtx, &grpc.StreamDesc{
 		ServerStreams: true,
 		ClientStreams: true,
-	}, fullMethod, grpc.CallContentSubtype("raw"))
+	}, fullMethod, grpc.ForceCodec(rawCodec{}))
 	if err != nil {
 		p.log.Error(err, "Failed to create backend stream", "session", sessionName, "method", fullMethod)
 		return status.Errorf(codes.Unavailable, "backend stream failed")
