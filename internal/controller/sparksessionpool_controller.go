@@ -230,9 +230,10 @@ func (r *SparkSessionPoolReconciler) calculateDesiredReplicas(
 			target = 20
 		}
 
-		desired = int32(1)
 		if totalSessions > 0 {
 			desired = (totalSessions + target - 1) / target // ceiling division
+		} else {
+			desired = pool.Spec.Replicas.Min
 		}
 
 		// Apply scale up threshold

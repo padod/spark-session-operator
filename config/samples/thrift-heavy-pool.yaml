@@ -7,7 +7,7 @@ spec:
   type: thrift
   host: spark-thrift-heavy.fnr-dev-i.corp.tander.ru
   replicas:
-    min: 1
+    min: 0
     max: 3
   scaling:
     metrics:

@@ -48,9 +48,10 @@ type SparkSessionPoolSpec struct {
 }
 
 type ReplicaSpec struct {
-	// Minimum number of pool instances (always running)
-	// +kubebuilder:validation:Minimum=1
-	// +kubebuilder:default=1
+	// Minimum number of pool instances (always running).
+	// Set to 0 to allow the pool to scale to zero when idle.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:default=0
 	Min int32 `json:"min"`
 
 	// Maximum number of pool instances
