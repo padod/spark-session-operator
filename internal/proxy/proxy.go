@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -90,7 +91,10 @@ func (p *SessionProxy) findPool(ctx context.Context, poolType string) (string, e
 
 // createSession creates a SparkInteractiveSession CR for the user.
 func (p *SessionProxy) createSession(ctx context.Context, username, poolName string) (string, error) {
-	sessionName := fmt.Sprintf("session-%s-%d", username, time.Now().UnixNano()%100000)
+	// Sanitize username for RFC 1123 subdomain: lowercase, replace underscores/dots with hyphens.
+	safeName := strings.ToLower(username)
+	safeName = strings.NewReplacer("_", "-", ".", "-").Replace(safeName)
+	sessionName := fmt.Sprintf("session-%s-%d", safeName, time.Now().UnixNano()%100000)
 	session := &sparkv1alpha1.SparkInteractiveSession{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      sessionName,
