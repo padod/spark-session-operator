@@ -1,0 +1,14 @@
+apiVersion: sparkinteractive.io/v1alpha1
+kind: SparkInteractiveSession
+metadata:
+  name: session-alice-12345
+  namespace: spark-dev
+  labels:
+    sparkinteractive.io/user: alice
+    sparkinteractive.io/pool: connect-pool
+spec:
+  user: alice
+  pool: connect-pool
+  sparkConf:
+    spark.executor.memory: "8g"
+    spark.dynamicAllocation.maxExecutors: "5"

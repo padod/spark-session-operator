@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- v1alpha1_sparksessionpool.yaml
+- v1alpha1_sparkinteractivesession.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

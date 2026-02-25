@@ -1,0 +1,107 @@
+apiVersion: sparkinteractive.io/v1alpha1
+kind: SparkSessionPool
+metadata:
+  name: connect-pool
+  namespace: spark-dev
+spec:
+  type: connect
+  replicas:
+    min: 1
+    max: 5
+  scaling:
+    metrics:
+      type: activeSessions
+      targetPerInstance: 20
+    scaleUpThreshold: "0.8"
+    scaleDownThreshold: "0.3"
+    cooldownSeconds: 300
+    drainBeforeScaleDown: true
+  sparkApplicationTemplate:
+    spec:
+      type: Scala
+      mode: cluster
+      image: "fnr-dev-team-docker-repo.repo.corp.tander.ru/spark-connect:1.4"
+      imagePullPolicy: Always
+      mainClass: org.tander.SparkConnectWrapper
+      mainApplicationFile: "local:///opt/spark/jars/spark-connect-wrapper.jar"
+      sparkVersion: "3.5.3"
+      restartPolicy:
+        type: Never
+      sparkConf:
+        spark.dynamicAllocation.maxExecutors: "10"
+        spark.dynamicAllocation.enabled: "true"
+        spark.dynamicAllocation.initialExecutors: "1"
+        spark.ui.port: "6001"
+        spark.sql.warehouse.dir: "s3a://fnr-dev-i-main-bucket/warehouse"
+        spark.hadoop.hive.metastore.warehouse.dir: "s3a://fnr-dev-i-main-bucket/warehouse"
+        spark.sql.catalogImplementation: hive
+        spark.sql.catalog.spark_catalog.type: hive
+        spark.hadoop.hive.metastore.uris: "thrift://hive-metastore.fnr-dev-i.corp.tander.ru:9083"
+        spark.hadoop.fs.s3a.fast.upload: "true"
+        spark.hadoop.fs.s3a.path.style.access: "true"
+        spark.hadoop.fs.s3a.committer.name: directory
+        spark.hadoop.fs.s3a.endpoint: storage.yandexcloud.net
+        spark.hadoop.fs.s3a.connection.ssl.enabled: "true"
+        spark.hadoop.fs.s3a.endpoint.region: ru-central1
+        spark.hadoop.fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+        spark.sql.hive.metastorePartitionPruning: "true"
+        spark.sql.parquet.filterPushdown: "true"
+        spark.sql.parquet.mergeSchema: "false"
+        spark.sql.parquet.output.committer.class: org.apache.spark.internal.io.cloud.BindingParquetOutputCommitter
+        spark.sql.sources.commitProtocolClass: org.apache.spark.internal.io.cloud.PathOutputCommitProtocol
+        spark.sql.sources.partitionOverwriteMode: dynamic
+        spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version: "2"
+        spark.hadoop.mapreduce.fileoutputcommitter.cleanup-failures.ignored: "true"
+        spark.hadoop.parquet.enable.summary-metadata: "false"
+        spark.sql.extensions: io.delta.sql.DeltaSparkSessionExtension
+        spark.sql.catalog.spark_catalog: org.apache.spark.sql.delta.catalog.DeltaCatalog
+        spark.kubernetes.file.upload.path: "s3a://fnr-dev-i-main-bucket/thriftserver"
+        spark.eventLog.enabled: "true"
+        spark.eventLog.dir: "s3a://fnr-dev-i-srv-bucket/spark"
+        spark.connect.grpc.binding.port: "8424"
+      driver:
+        cores: 1
+        memory: "4g"
+        labels:
+          version: "3.5.3"
+        nodeSelector:
+          dedicated-to-services: spark-i-nosla  # adjust to your node labels
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated-to-services
+            operator: Equal
+            value: spark-i-nosla
+        envFrom:
+          - secretRef:
+              name: spark-dev-s3-secret
+        serviceAccount: spark-operator
+      executor:
+        cores: 4
+        instances: 1
+        memory: "16g"
+        labels:
+          version: "3.5.3"
+        nodeSelector:
+          dedicated-to-services: spark-i-nosla
+        tolerations:
+          - effect: NoSchedule
+            key: dedicated-to-services
+            operator: Equal
+            value: spark-i-nosla
+        envFrom:
+          - secretRef:
+              name: spark-dev-s3-secret
+  sessionPolicy:
+    maxSessionsPerUser: 5
+    maxTotalSessions: 200
+    idleTimeoutMinutes: 720  # 12 hours
+    defaultSessionConf:
+      spark.dynamicAllocation.maxExecutors: "10"
+      spark.executor.memory: "4g"
+      spark.executor.cores: "2"
+    quotas:
+      - match:
+          users: ["admin"]
+        maxSessionsPerUser: 20
+        sessionConf:
+          spark.dynamicAllocation.maxExecutors: "20"
