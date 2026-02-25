@@ -18,7 +18,9 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc/metadata"
 )
@@ -28,19 +30,31 @@ const (
 	grpcMetadataPassword = "x-spark-password"
 )
 
-// extractCredentialsFromGRPCMetadata extracts username and password from gRPC metadata headers.
-// Users set these via spark.connect.grpc.metadata config:
-//   - x-spark-username: the user's domain username
-//   - x-spark-password: the user's domain password
+// extractCredentialsFromGRPCMetadata extracts username and password from gRPC metadata.
+// Supports two mechanisms:
+//  1. Authorization header with Basic auth: "Basic base64(user:pass)"
+//     PySpark sends this via the token param: sc://host:port/;token=base64(user:pass)
+//     which sets the "authorization" metadata to "Bearer base64(user:pass)".
+//     We accept both "Basic" and "Bearer" schemes with base64(user:pass) payload.
+//  2. Explicit x-spark-username / x-spark-password metadata headers (fallback).
 func extractCredentialsFromGRPCMetadata(ctx context.Context) (username, password string, err error) {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		return "", "", fmt.Errorf("no gRPC metadata in context")
 	}
 
+	// Try Authorization header first (Basic or Bearer with base64(user:pass))
+	if authVals := md.Get("authorization"); len(authVals) > 0 {
+		username, password, err = parseBasicAuth(authVals[0])
+		if err == nil {
+			return username, password, nil
+		}
+	}
+
+	// Fallback: explicit metadata headers
 	userVals := md.Get(grpcMetadataUsername)
 	if len(userVals) == 0 {
-		return "", "", fmt.Errorf("missing %s metadata header", grpcMetadataUsername)
+		return "", "", fmt.Errorf("missing credentials: provide Authorization header (Basic base64(user:pass)) or %s/%s metadata headers", grpcMetadataUsername, grpcMetadataPassword)
 	}
 	username = userVals[0]
 
@@ -52,6 +66,40 @@ func extractCredentialsFromGRPCMetadata(ctx context.Context) (username, password
 
 	if username == "" {
 		return "", "", fmt.Errorf("empty %s metadata header", grpcMetadataUsername)
+	}
+
+	return username, password, nil
+}
+
+// parseBasicAuth parses "Basic base64(user:pass)" or "Bearer base64(user:pass)".
+// PySpark's token param sets "Bearer <token>", so we accept both schemes.
+func parseBasicAuth(header string) (username, password string, err error) {
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 {
+		return "", "", fmt.Errorf("invalid authorization header format")
+	}
+
+	scheme := strings.ToLower(parts[0])
+	if scheme != "basic" && scheme != "bearer" {
+		return "", "", fmt.Errorf("unsupported auth scheme: %s", parts[0])
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(parts[1])
+	if err != nil {
+		return "", "", fmt.Errorf("invalid base64 in authorization header: %w", err)
+	}
+
+	credentials := string(decoded)
+	idx := strings.IndexByte(credentials, ':')
+	if idx < 0 {
+		return "", "", fmt.Errorf("authorization header missing ':' separator (expected base64(user:pass))")
+	}
+
+	username = credentials[:idx]
+	password = credentials[idx+1:]
+
+	if username == "" {
+		return "", "", fmt.Errorf("empty username in authorization header")
 	}
 
 	return username, password, nil

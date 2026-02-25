@@ -11,7 +11,7 @@ metadata:
 spec:
   ingressClassName: nginx
   rules:
-  - host: spark-api.example.com
+  - host: spark-api.fnr-dev-i.corp.tander.ru
     http:
       paths:
       - path: /
@@ -31,13 +31,12 @@ metadata:
     app.kubernetes.io/name: spark-session-operator
     app.kubernetes.io/managed-by: kustomize
   annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: "GRPC"
-    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
-    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/backend-protocol: GRPC
+    yandex.cloud/load-balancer-type: internal
 spec:
   ingressClassName: nginx
   rules:
-  - host: spark-connect.example.com
+  - host: spark-connect.fnr-dev-i.corp.tander.ru
     http:
       paths:
       - path: /
