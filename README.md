@@ -73,7 +73,26 @@ kubectl apply -f config/samples/connect-pool.yaml
 kubectl apply -f config/samples/thrift-pool.yaml
 ```
 
-### 5. Connect via proxy
+### 5. Configure Keycloak (for proxy auth)
+
+The proxy authenticates users via Keycloak's Resource Owner Password Credentials (ROPC) grant. Skip this step if you're only creating sessions via `kubectl`.
+
+1. In your Keycloak realm, create a new client (e.g. `spark-session-operator`)
+2. Set **Client authentication** to `On` (confidential) or `Off` (public), depending on your security requirements
+3. Under **Authentication flow overrides**, enable **Direct access grants** (this enables the ROPC flow)
+4. Note the **Client ID** and **Client secret** (if confidential)
+
+Then pass the credentials to the operator:
+
+```sh
+--oidc-issuer-url=https://keycloak.example.com/realms/spark \
+--oidc-client-id=spark-session-operator \
+--oidc-client-secret=<client-secret>   # omit if public client
+```
+
+Users will authenticate with their regular Keycloak username and password — the proxy exchanges these for a JWT automatically.
+
+### 6. Connect via proxy
 
 **DBeaver (Thrift):**
 1. Create a new Apache Hive connection
