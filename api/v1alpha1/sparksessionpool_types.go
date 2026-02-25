@@ -27,6 +27,12 @@ type SparkSessionPoolSpec struct {
 	// +kubebuilder:validation:Enum=connect;thrift
 	Type string `json:"type"`
 
+	// Host is the hostname for routing traffic to this pool.
+	// The controller auto-creates an Ingress for this hostname.
+	// For connect pools, the proxy routes by gRPC :authority header.
+	// +kubebuilder:validation:MinLength=1
+	Host string `json:"host"`
+
 	// Replicas defines min/max pool size
 	Replicas ReplicaSpec `json:"replicas"`
 
@@ -177,6 +183,7 @@ type PoolInstanceStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:printcolumn:name="Type",type=string,JSONPath=`.spec.type`
+// +kubebuilder:printcolumn:name="Host",type=string,JSONPath=`.spec.host`
 // +kubebuilder:printcolumn:name="Replicas",type=integer,JSONPath=`.status.currentReplicas`
 // +kubebuilder:printcolumn:name="Ready",type=integer,JSONPath=`.status.readyReplicas`
 // +kubebuilder:printcolumn:name="Sessions",type=integer,JSONPath=`.status.totalActiveSessions`

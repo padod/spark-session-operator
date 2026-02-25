@@ -34,7 +34,7 @@ const (
 	// All request types (ExecutePlan, AnalyzePlan, Config, etc.) have user_context as field 2.
 	// UserContext has user_id as field 1.
 	protoFieldUserContext protowire.Number = 2
-	protoFieldUserID     protowire.Number = 1
+	protoFieldUserID      protowire.Number = 1
 )
 
 // extractCredentialsFromGRPCMetadata extracts username and password from gRPC metadata.

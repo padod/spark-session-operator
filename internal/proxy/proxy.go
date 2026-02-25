@@ -32,6 +32,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	sparkv1alpha1 "github.com/tander/spark-session-operator/api/v1alpha1"
@@ -92,6 +93,21 @@ func (p *SessionProxy) findPool(ctx context.Context, poolType string) (string, e
 		return "", fmt.Errorf("found %d pools of type %q in namespace %s (expected exactly 1): %v",
 			len(matches), poolType, p.namespace, matches)
 	}
+}
+
+// findPoolByHost finds a pool by its spec.host field in the namespace.
+// Returns the pool name and pool type, or an error if no pool matches.
+func (p *SessionProxy) findPoolByHost(ctx context.Context, host string) (string, string, error) {
+	poolList := &sparkv1alpha1.SparkSessionPoolList{}
+	if err := p.client.List(ctx, poolList, client.InNamespace(p.namespace)); err != nil {
+		return "", "", fmt.Errorf("list pools: %w", err)
+	}
+	for _, pool := range poolList.Items {
+		if pool.Spec.Host == host {
+			return pool.Name, pool.Spec.Type, nil
+		}
+	}
+	return "", "", fmt.Errorf("no pool with host %q in namespace %s", host, p.namespace)
 }
 
 // sessionKey returns the map key for session tracking.
@@ -421,11 +437,37 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 
 	p.log.Info("Connect user authenticated", "user", userInfo.Username)
 
-	// 4. Find pool
-	poolName, err := p.findPool(ctx, "connect")
-	if err != nil {
-		p.log.Error(err, "Failed to find connect pool", "user", userInfo.Username)
-		return status.Errorf(codes.FailedPrecondition, "%v", err)
+	// 4. Find pool by :authority header (hostname-based routing)
+	authority := ""
+	if md, ok := metadata.FromIncomingContext(ctx); ok {
+		if vals := md.Get(":authority"); len(vals) > 0 {
+			authority = vals[0]
+		}
+	}
+	// Strip port if present
+	if idx := strings.LastIndex(authority, ":"); idx > 0 {
+		authority = authority[:idx]
+	}
+
+	var poolName string
+	if authority != "" {
+		var poolType string
+		poolName, poolType, err = p.findPoolByHost(ctx, authority)
+		if err != nil {
+			p.log.Error(err, "Failed to find pool by host", "authority", authority, "user", userInfo.Username)
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
+		if poolType != "connect" {
+			p.log.Error(nil, "Pool matched by host is not a connect pool", "authority", authority, "poolType", poolType)
+			return status.Errorf(codes.FailedPrecondition, "pool %q is type %q, expected connect", poolName, poolType)
+		}
+	} else {
+		// Fallback: no authority header, use legacy single-pool lookup
+		poolName, err = p.findPool(ctx, "connect")
+		if err != nil {
+			p.log.Error(err, "Failed to find connect pool", "user", userInfo.Username)
+			return status.Errorf(codes.FailedPrecondition, "%v", err)
+		}
 	}
 
 	// 5. Find existing or create new session

@@ -18,6 +18,9 @@ spec:
     - jsonPath: .spec.type
       name: Type
       type: string
+    - jsonPath: .spec.host
+      name: Host
+      type: string
     - jsonPath: .status.currentReplicas
       name: Replicas
       type: integer
@@ -56,6 +59,13 @@ spec:
             description: SparkSessionPoolSpec defines the desired state of a pool
               of Spark server instances
             properties:
+              host:
+                description: |-
+                  Host is the hostname for routing traffic to this pool.
+                  The controller auto-creates an Ingress for this hostname.
+                  For connect pools, the proxy routes by gRPC :authority header.
+                minLength: 1
+                type: string
               replicas:
                 description: Replicas defines min/max pool size
                 properties:
@@ -208,6 +218,7 @@ spec:
                 - thrift
                 type: string
             required:
+            - host
             - replicas
             - scaling
             - sessionPolicy

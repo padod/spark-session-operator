@@ -76,6 +76,7 @@ func (g *SessionGateway) Start(addr string) error {
 	api := router.PathPrefix("/api/v1").Subrouter()
 	api.Use(g.authMiddleware)
 
+	api.HandleFunc("/pools", g.listPools).Methods("GET")
 	api.HandleFunc("/sessions", g.listSessions).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.getSession).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.deleteSession).Methods("DELETE")
@@ -127,6 +128,58 @@ func (g *SessionGateway) extractUser(r *http.Request) (*auth.UserInfo, error) {
 	}
 
 	return g.auth.ValidateToken(parts[1])
+}
+
+// PoolResponse returned for pool listing
+type PoolResponse struct {
+	Name                string            `json:"name"`
+	Type                string            `json:"type"`
+	Host                string            `json:"host"`
+	MinReplicas         int32             `json:"minReplicas"`
+	MaxReplicas         int32             `json:"maxReplicas"`
+	CurrentReplicas     int32             `json:"currentReplicas"`
+	ReadyReplicas       int32             `json:"readyReplicas"`
+	TotalActiveSessions int32             `json:"totalActiveSessions"`
+	SessionPolicy       SessionPolicyInfo `json:"sessionPolicy"`
+}
+
+// SessionPolicyInfo is a subset of session policy for the API response
+type SessionPolicyInfo struct {
+	MaxSessionsPerUser int32             `json:"maxSessionsPerUser"`
+	MaxTotalSessions   int32             `json:"maxTotalSessions"`
+	IdleTimeoutMinutes int32             `json:"idleTimeoutMinutes"`
+	DefaultSessionConf map[string]string `json:"defaultSessionConf,omitempty"`
+}
+
+func (g *SessionGateway) listPools(w http.ResponseWriter, r *http.Request) {
+	poolList := &sparkv1alpha1.SparkSessionPoolList{}
+	if err := g.client.List(r.Context(), poolList, client.InNamespace(g.namespace)); err != nil {
+		g.writeError(w, http.StatusInternalServerError, "list_failed", err.Error())
+		return
+	}
+
+	var responses []PoolResponse
+	for i := range poolList.Items {
+		p := &poolList.Items[i]
+		responses = append(responses, PoolResponse{
+			Name:                p.Name,
+			Type:                p.Spec.Type,
+			Host:                p.Spec.Host,
+			MinReplicas:         p.Spec.Replicas.Min,
+			MaxReplicas:         p.Spec.Replicas.Max,
+			CurrentReplicas:     p.Status.CurrentReplicas,
+			ReadyReplicas:       p.Status.ReadyReplicas,
+			TotalActiveSessions: p.Status.TotalActiveSessions,
+			SessionPolicy: SessionPolicyInfo{
+				MaxSessionsPerUser: p.Spec.SessionPolicy.MaxSessionsPerUser,
+				MaxTotalSessions:   p.Spec.SessionPolicy.MaxTotalSessions,
+				IdleTimeoutMinutes: p.Spec.SessionPolicy.IdleTimeoutMinutes,
+				DefaultSessionConf: p.Spec.SessionPolicy.DefaultSessionConf,
+			},
+		})
+	}
+
+	g.writeJSON(w, http.StatusOK, responses)
 }
 
 func (g *SessionGateway) listSessions(w http.ResponseWriter, r *http.Request) {

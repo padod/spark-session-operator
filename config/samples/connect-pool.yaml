@@ -5,6 +5,7 @@ metadata:
   namespace: spark-dev
 spec:
   type: connect
+  host: spark-connect.fnr-dev-i.corp.tander.ru
   replicas:
     min: 1
     max: 5

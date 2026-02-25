@@ -5,6 +5,7 @@ metadata:
   namespace: spark-dev
 spec:
   type: thrift
+  host: spark-thrift.fnr-dev-i.corp.tander.ru
   replicas:
     min: 1
     max: 5

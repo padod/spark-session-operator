@@ -22,31 +22,6 @@ spec:
             port:
               number: 8080
 ---
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: connect-proxy
-  namespace: system
-  labels:
-    app.kubernetes.io/name: spark-session-operator
-    app.kubernetes.io/managed-by: kustomize
-  annotations:
-    nginx.ingress.kubernetes.io/backend-protocol: GRPC
-    yandex.cloud/load-balancer-type: internal
-spec:
-  ingressClassName: nginx
-  rules:
-  - host: spark-connect.fnr-dev-i.corp.tander.ru
-    http:
-      paths:
-      - path: /
-        pathType: Prefix
-        backend:
-          service:
-            name: proxy
-            port:
-              number: 15002
----
 # Thrift proxy uses raw TCP — nginx ingress handles this via a ConfigMap.
 # This ConfigMap must be referenced by the nginx ingress controller via
 # --tcp-services-configmap=spark-session-operator/spark-session-operator-thrift-tcp.

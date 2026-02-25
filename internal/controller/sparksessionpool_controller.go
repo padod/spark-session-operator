@@ -27,6 +27,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -68,6 +69,7 @@ type SparkSessionPoolReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups=metrics.k8s.io,resources=pods,verbs=get;list
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
 
 func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pool", req.NamespacedName)
@@ -92,6 +94,12 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if err := r.Update(ctx, pool); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Reconcile Ingress for hostname-based routing
+	if err := r.reconcileIngress(ctx, log, pool); err != nil {
+		log.Error(err, "Failed to reconcile Ingress")
+		return ctrl.Result{}, err
 	}
 
 	// List existing SparkApplications owned by this pool
@@ -569,6 +577,85 @@ func (r *SparkSessionPoolReconciler) handleDeletion(
 		}
 	}
 	return ctrl.Result{}, nil
+}
+
+// reconcileIngress creates or updates an Ingress for connect pools to enable hostname-based routing.
+func (r *SparkSessionPoolReconciler) reconcileIngress(
+	ctx context.Context,
+	log logr.Logger,
+	pool *sparkv1alpha1.SparkSessionPool,
+) error {
+	if pool.Spec.Type != "connect" {
+		return nil // Only connect pools get auto-Ingress for now
+	}
+
+	ingressName := pool.Name + "-connect"
+	pathType := networkingv1.PathTypePrefix
+
+	const proxyServiceName = "spark-session-operator-proxy"
+
+	desired := &networkingv1.Ingress{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      ingressName,
+			Namespace: pool.Namespace,
+			Labels: map[string]string{
+				"sparkinteractive.io/pool":       pool.Name,
+				"sparkinteractive.io/managed-by": "spark-session-operator",
+			},
+			Annotations: map[string]string{
+				"nginx.ingress.kubernetes.io/backend-protocol": "GRPC",
+			},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: pool.APIVersion,
+				Kind:       pool.Kind,
+				Name:       pool.Name,
+				UID:        pool.UID,
+				Controller: boolPtr(true),
+			}},
+		},
+		Spec: networkingv1.IngressSpec{
+			IngressClassName: stringPtr("nginx"),
+			Rules: []networkingv1.IngressRule{{
+				Host: pool.Spec.Host,
+				IngressRuleValue: networkingv1.IngressRuleValue{
+					HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{{
+							Path:     "/",
+							PathType: &pathType,
+							Backend: networkingv1.IngressBackend{
+								Service: &networkingv1.IngressServiceBackend{
+									Name: proxyServiceName,
+									Port: networkingv1.ServiceBackendPort{Number: 15002},
+								},
+							},
+						}},
+					},
+				},
+			}},
+		},
+	}
+
+	existing := &networkingv1.Ingress{}
+	err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: ingressName}, existing)
+	if errors.IsNotFound(err) {
+		log.Info("Creating Ingress for pool", "ingress", ingressName, "host", pool.Spec.Host)
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return fmt.Errorf("get ingress %s: %w", ingressName, err)
+	}
+
+	// Update spec and annotations if changed
+	existing.Spec = desired.Spec
+	existing.Labels = desired.Labels
+	existing.Annotations = desired.Annotations
+	existing.OwnerReferences = desired.OwnerReferences
+	log.V(1).Info("Updating Ingress for pool", "ingress", ingressName, "host", pool.Spec.Host)
+	return r.Update(ctx, existing)
+}
+
+func stringPtr(s string) *string {
+	return &s
 }
 
 // SetupWithManager sets up the controller with the Manager.
