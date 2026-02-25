@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "spark-session-operator-system"
+const namespace = "spark-session-operator"
 
 // serviceAccountName created for the project
 const serviceAccountName = "spark-session-operator-controller-manager"

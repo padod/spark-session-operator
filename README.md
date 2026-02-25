@@ -59,9 +59,11 @@ make docker-build docker-push IMG=$IMG
 make deploy IMG=$IMG
 ```
 
-This deploys the controller manager, service account, RBAC roles, and CRDs into the `spark-session-operator-system` namespace.
+This deploys the controller manager, service account, RBAC roles, and CRDs into the `spark-session-operator` namespace.
 
 ### 4. Create a SparkSessionPool
+
+Each pool manages a set of identical Spark server instances of a given type. The proxy auto-selects the pool by type — there must be exactly one pool of each type (`connect` or `thrift`) in the namespace.
 
 Apply one of the sample pools:
 
@@ -71,6 +73,46 @@ kubectl apply -f config/samples/connect-pool.yaml
 
 # Spark Thrift Server pool
 kubectl apply -f config/samples/thrift-pool.yaml
+```
+
+A pool defines three things:
+
+**1. Server type and replicas**
+
+```yaml
+spec:
+  type: connect        # "connect" (Spark Connect gRPC) or "thrift" (HiveServer2)
+  replicas:
+    min: 1             # Always keep at least this many instances running
+    max: 5             # Never scale beyond this
+```
+
+**2. SparkApplication template** — the full Spark Operator `SparkApplication` spec used to create each instance. This is where you configure the Spark image, driver/executor resources, Hive metastore, S3, Delta Lake, etc. The operator creates one `SparkApplication` CR per pool instance using this template.
+
+**3. Session policy** — controls per-user limits and idle cleanup:
+
+```yaml
+spec:
+  sessionPolicy:
+    maxSessionsPerUser: 5       # Max concurrent sessions per user
+    maxTotalSessions: 200       # Max sessions across the pool
+    idleTimeoutMinutes: 720     # Kill sessions idle for 12+ hours
+    defaultSessionConf:         # Default Spark configs applied to each session
+      spark.executor.memory: "4g"
+    quotas:                     # Per-user/group overrides
+      - match:
+          users: ["admin"]
+        maxSessionsPerUser: 20
+        sessionConf:
+          spark.dynamicAllocation.maxExecutors: "20"
+```
+
+Verify the pool is running:
+
+```sh
+kubectl get sparksessionpools -n spark-dev
+# NAME           TYPE      REPLICAS   READY   SESSIONS   AGE
+# connect-pool   connect   1          1       0          5m
 ```
 
 ### 5. Configure Keycloak (for proxy auth)
