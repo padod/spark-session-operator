@@ -113,6 +113,7 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// Calculate desired replicas
 	currentRunning := int32(0)
 	currentReady := int32(0)
+	currentPending := int32(0)
 	totalSessions := int32(0)
 	for _, inst := range instanceStatuses {
 		if inst.State == "Running" || inst.State == "Draining" {
@@ -121,15 +122,19 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		if inst.State == "Running" {
 			currentReady++
 		}
+		if inst.State == "Pending" || inst.State == "Submitted" || inst.State == "" {
+			currentPending++
+		}
 		totalSessions += inst.ActiveSessions
 	}
 
 	desiredReplicas := r.calculateDesiredReplicas(ctx, pool, currentReady, totalSessions, instanceStatuses)
 
-	// Scale up if needed
-	if currentRunning < desiredReplicas {
-		toCreate := desiredReplicas - currentRunning
-		log.Info("Scaling up", "current", currentRunning, "desired", desiredReplicas, "creating", toCreate)
+	// Scale up if needed (count pending instances to avoid creating duplicates while Spark apps are starting)
+	currentTotal := currentRunning + currentPending
+	if currentTotal < desiredReplicas {
+		toCreate := desiredReplicas - currentTotal
+		log.Info("Scaling up", "current", currentRunning, "pending", currentPending, "desired", desiredReplicas, "creating", toCreate)
 		for i := int32(0); i < toCreate; i++ {
 			if err := r.createPoolInstance(ctx, log, pool, existingApps); err != nil {
 				log.Error(err, "Failed to create pool instance")
