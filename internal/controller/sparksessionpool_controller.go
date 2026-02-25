@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -108,7 +109,7 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	// Update instance statuses
-	instanceStatuses := r.buildInstanceStatuses(existingApps, sessionCounts)
+	instanceStatuses := r.buildInstanceStatuses(ctx, pool.Namespace, existingApps, sessionCounts)
 
 	// Calculate desired replicas
 	currentRunning := int32(0)
@@ -470,6 +471,8 @@ func (r *SparkSessionPoolReconciler) countSessionsPerInstance(
 }
 
 func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
+	ctx context.Context,
+	namespace string,
 	apps []unstructured.Unstructured,
 	sessionCounts map[string]int32,
 ) []sparkv1alpha1.PoolInstanceStatus {
@@ -492,11 +495,23 @@ func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
 			} else {
 				state = "Running"
 			}
-			// Build endpoint from driver service name
-			driverSvc, _, _ := unstructured.NestedString(app.Object, "status", "driverInfo", "podName")
-			if driverSvc != "" {
-				ns := app.GetNamespace()
-				endpoint = fmt.Sprintf("%s-svc.%s.svc", driverSvc, ns)
+			// Look up the driver service by spark-app-selector label.
+			// The spark-operator creates a headless service labeled with
+			// spark-app-selector=<sparkApplicationId>.
+			sparkAppID, _, _ := unstructured.NestedString(app.Object, "status", "sparkApplicationId")
+			if sparkAppID != "" {
+				svcList := &corev1.ServiceList{}
+				if err := r.List(ctx, svcList,
+					client.InNamespace(namespace),
+					client.MatchingLabels{"spark-app-selector": sparkAppID},
+				); err == nil {
+					for _, svc := range svcList.Items {
+						if strings.HasSuffix(svc.Name, "-driver-svc") {
+							endpoint = fmt.Sprintf("%s.%s.svc", svc.Name, namespace)
+							break
+						}
+					}
+				}
 			}
 		case "FAILED", "FAILING":
 			state = "Failed"
