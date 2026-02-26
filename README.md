@@ -4,27 +4,46 @@ A Kubernetes operator that manages pools of interactive Spark servers (Spark Con
 
 ## Architecture
 
+![Architecture](docs/architecture.png)
+
+> Diagram source: [`docs/architecture.dot`](docs/architecture.dot). Regenerate with `dot -Tpng docs/architecture.dot -o docs/architecture.png -Gdpi=150`.
+
 The operator manages two CRDs:
 
-- **SparkSessionPool** — a scalable pool of SparkApplication instances (Spark Connect or Thrift Server). The controller creates/deletes SparkApplication CRs via the Spark Operator based on load.
+- **SparkSessionPool** — a scalable pool of SparkApplication instances (Spark Connect or Thrift Server). The controller creates/deletes SparkApplication CRs via the Spark Operator based on load. Each pool has its own hostname and a dynamically created Ingress for routing.
 - **SparkInteractiveSession** — a per-user session assignment. The controller assigns users to the least-loaded pool instance, enforces quotas, and handles idle timeouts.
 
 Additional components running in the same binary:
 
 - **REST API Gateway** (`:8080`) — OIDC-authenticated HTTP API for listing/deleting sessions
-- **Thrift Proxy** (`:10009`) — SASL PLAIN-authenticated proxy that auto-creates sessions for Thrift (HiveServer2) connections
-- **Connect Proxy** (`:15002`) — gRPC proxy that auto-creates sessions for Spark Connect connections
+- **Thrift HTTP Proxy** (`:10009`) — HTTP reverse proxy with Basic auth (Keycloak ROPC) that auto-creates sessions for Thrift (HiveServer2 HTTP transport) connections
+- **Connect gRPC Proxy** (`:15002`) — gRPC proxy that auto-creates sessions for Spark Connect connections
 - **Metrics Client** — queries the Kubernetes Metrics API (`metrics.k8s.io`) for CPU/memory-based scaling
+
+### Hostname-based routing
+
+Each pool defines a `spec.host` field (e.g. `spark-connect-default.example.com`). The pool controller automatically creates an Ingress per pool in the operator's namespace, routing traffic to the appropriate proxy port:
+
+| Pool type | Ingress backend | Protocol | Port |
+|-----------|----------------|----------|------|
+| `connect` | gRPC proxy | GRPC | 15002 |
+| `thrift`  | Thrift HTTP proxy | HTTP | 10009 |
+
+This allows multiple pools of the same type (e.g. `connect-default-pool` and `connect-heavy-pool`) to coexist. The proxy selects the target pool by hostname: the Thrift HTTP proxy uses the standard `Host` header (preserved by nginx for HTTP backends), while the Connect gRPC proxy reads `X-Forwarded-Host` from gRPC metadata (nginx rewrites `:authority` for gRPC backends, so a `configuration-snippet` annotation injects the original host).
+
+### Scale from zero
+
+Pools support `replicas.min: 0`. When a user connects and no instances exist, the proxy creates a session CR in `Pending` state. The pool controller counts pending unassigned sessions alongside active ones, triggering SparkApplication creation even when the pool has zero running instances.
 
 ### Session creation paths
 
 | Path | Protocol | Use case |
 |------|----------|----------|
-| **Proxy** (primary) | Thrift SASL / gRPC metadata | Interactive users from Jupyter, DBeaver, PySpark |
+| **Proxy** (primary) | Thrift HTTP / gRPC | Interactive users from Jupyter, DBeaver, PySpark |
 | **kubectl / K8s API** | SparkInteractiveSession CR | Automation / CI pipelines |
 | **REST API** | HTTP (read + delete only) | List sessions, get details, terminate sessions |
 
-Users connect with their domain credentials (Keycloak username/password). The proxy exchanges credentials for a JWT via Keycloak's ROPC grant, auto-selects the pool, creates a session, waits for it to become active, and proxies traffic transparently. Keepalive is handled automatically while the connection is open.
+Users connect with their domain credentials (Keycloak username/password). The proxy exchanges credentials for a JWT via Keycloak's ROPC grant, selects the pool by hostname, creates a session, waits for it to become active, and proxies traffic transparently. Keepalive is handled automatically while the connection is open.
 
 ## Prerequisites
 
@@ -32,6 +51,7 @@ Users connect with their domain credentials (Keycloak username/password). The pr
 - [Spark Operator](https://github.com/kubeflow/spark-operator) installed (manages SparkApplication CRs)
 - [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) installed (required for `cpu`/`memory` scaling; not needed for `activeSessions`)
 - [Keycloak](https://www.keycloak.org/) or compatible OIDC provider (with ROPC grant enabled for the proxy client)
+- Nginx Ingress Controller (for dynamic per-pool Ingress routing)
 - `kubectl` configured to access your cluster
 - Go 1.23+ (for building from source)
 - Docker (for building the container image)
@@ -61,30 +81,33 @@ make deploy IMG=$IMG
 
 This deploys the controller manager, service account, RBAC roles, and CRDs into the `spark-session-operator` namespace.
 
-### 4. Create a SparkSessionPool
+### 4. Create SparkSessionPools
 
-Each pool manages a set of identical Spark server instances of a given type. The proxy auto-selects the pool by type — there must be exactly one pool of each type (`connect` or `thrift`) in the namespace.
+Each pool manages a set of identical Spark server instances. Pools are identified by hostname — you can have multiple pools of the same type with different resource profiles (e.g. `connect-default-pool` and `connect-heavy-pool`).
 
-Apply one of the sample pools:
+Apply the sample pools:
 
 ```sh
-# Spark Connect pool
+# Spark Connect pools (default + heavy)
 kubectl apply -f config/samples/connect-pool.yaml
+kubectl apply -f config/samples/connect-heavy-pool.yaml
 
-# Spark Thrift Server pool
+# Spark Thrift Server pools
 kubectl apply -f config/samples/thrift-pool.yaml
+kubectl apply -f config/samples/thrift-heavy-pool.yaml
 ```
 
 A pool defines three things:
 
-**1. Server type and replicas**
+**1. Server type, hostname, and replicas**
 
 ```yaml
 spec:
-  type: connect        # "connect" (Spark Connect gRPC) or "thrift" (HiveServer2)
+  type: connect                                      # "connect" or "thrift"
+  host: spark-connect-default.example.com            # Hostname for Ingress routing
   replicas:
-    min: 1             # Always keep at least this many instances running
-    max: 5             # Never scale beyond this
+    min: 0             # Min instances (0 = scale from zero)
+    max: 5             # Maximum instances
 ```
 
 **2. SparkApplication template** — the full Spark Operator `SparkApplication` spec used to create each instance. This is where you configure the Spark image, driver/executor resources, Hive metastore, S3, Delta Lake, etc. The operator creates one `SparkApplication` CR per pool instance using this template.
@@ -107,12 +130,24 @@ spec:
           spark.dynamicAllocation.maxExecutors: "20"
 ```
 
-Verify the pool is running:
+Verify the pools are created:
 
 ```sh
 kubectl get sparksessionpools -n spark-dev
-# NAME           TYPE      REPLICAS   READY   SESSIONS   AGE
-# connect-pool   connect   1          1       0          5m
+# NAME                   TYPE      REPLICAS   READY   SESSIONS   AGE
+# connect-default-pool   connect   0          0       0          5m
+# connect-heavy-pool     connect   0          0       0          5m
+# thrift-default-pool    thrift    0          0       0          5m
+```
+
+The operator automatically creates an Ingress for each pool. Verify:
+
+```sh
+kubectl get ingress -n spark-session-operator
+# NAME                          HOSTS                                   ...
+# connect-default-pool-connect  spark-connect-default.example.com       ...
+# connect-heavy-pool-connect    spark-connect-heavy.example.com         ...
+# thrift-default-pool-thrift    spark-thrift-default.example.com        ...
 ```
 
 ### 5. Configure Keycloak (for proxy auth)
@@ -134,34 +169,55 @@ Then pass the credentials to the operator:
 
 Users will authenticate with their regular Keycloak username and password — the proxy exchanges these for a JWT automatically.
 
+For development or testing without a Keycloak instance, you can skip token validation entirely:
+
+```sh
+--oidc-skip-validation=true
+```
+
+In this mode the proxy accepts any username/password without contacting an OIDC provider. The username is taken as-is for session ownership. **Do not use this in production.**
+
 ### 6. Connect via proxy
 
-**DBeaver (Thrift):**
+**DBeaver (Thrift via HTTP transport):**
 1. Create a new Apache Hive connection
-2. Host: `<proxy-endpoint>`, Port: `10009`
+2. JDBC URL: `jdbc:hive2://spark-thrift-default.example.com:80/default;transportMode=http;httpPath=cliservice`
 3. Authentication: enter your domain username and password
 4. A session is auto-created when you connect
 
-**PyHive (Thrift):**
+**PyHive (Thrift via HTTP transport):**
 ```python
 from pyhive import hive
 
 conn = hive.connect(
-    host='<proxy-endpoint>',
-    port=10009,
+    host='spark-thrift-default.example.com',
+    port=80,
     auth='CUSTOM',
     username='alice',
     password='my-domain-password',
+    thrift_transport=hive.Transport.HTTP,
+    http_path='cliservice',
 )
 ```
 
 **PySpark (Spark Connect):**
 ```python
 from pyspark.sql import SparkSession
+import base64
+
+token = base64.b64encode(b"alice:my-domain-password").decode()
 
 spark = SparkSession.builder \
-    .remote("sc://<proxy-endpoint>:15002") \
-    .config("spark.connect.grpc.metadata", "x-spark-username=alice,x-spark-password=my-domain-password") \
+    .remote("sc://spark-connect-default.example.com:443/;token=" + token) \
+    .getOrCreate()
+
+spark.sql("SELECT 1").show()
+```
+
+Or with explicit gRPC metadata (insecure channel):
+```python
+spark = SparkSession.builder \
+    .remote("sc://spark-connect-default.example.com:80/;user_id=" + token) \
     .getOrCreate()
 ```
 
@@ -177,26 +233,14 @@ When creating sessions via `kubectl apply`, you don't need Keycloak or the proxy
 kubectl get sparkinteractivesession <session-name> -n spark-dev -o jsonpath='{.status.endpoint}'
 ```
 
-Then port-forward to the assigned instance (Spark Connect listens on port 8424 inside the pod, Thrift on 8972):
+Then port-forward to the assigned instance:
 
 ```sh
-# Spark Connect
+# Spark Connect (port 8424 inside the pod)
 kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 15002:8424
 
-# Spark Thrift Server
-kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 10009:8972
-```
-
-And connect with PySpark without credentials:
-
-```python
-from pyspark.sql import SparkSession
-
-spark = SparkSession.builder \
-    .remote("sc://localhost:15002") \
-    .getOrCreate()
-
-spark.sql("SELECT 1").show()
+# Spark Thrift Server (port 10001 inside the pod, HTTP transport)
+kubectl port-forward pod/<assigned-instance-driver> -n spark-dev 10009:10001
 ```
 
 ## Configuration
@@ -206,8 +250,9 @@ The operator accepts the following command-line flags:
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--namespace` | `spark-dev` | Namespace to watch and manage resources in |
+| `--proxy-namespace` | `spark-session-operator` | Namespace where the proxy Service and Ingresses live |
 | `--gateway-addr` | `:8080` | Address for the REST API gateway |
-| `--thrift-proxy-addr` | `:10009` | Address for the Thrift proxy |
+| `--thrift-proxy-addr` | `:10009` | Address for the Thrift HTTP proxy |
 | `--connect-proxy-addr` | `:15002` | Address for the Spark Connect gRPC proxy |
 | `--oidc-issuer-url` | _(empty)_ | OIDC issuer URL (e.g. `https://keycloak.example.com/realms/spark`) |
 | `--oidc-audience` | _(empty)_ | Expected OIDC audience |
@@ -223,7 +268,29 @@ The operator accepts the following command-line flags:
 
 ## REST API
 
-All endpoints require an `Authorization: Bearer <token>` header.
+All endpoints require an `Authorization: Bearer <token>` header with a Keycloak JWT.
+
+**For users** — open this link in a browser, log in with your domain credentials, and copy the token from the response:
+```
+https://keycloak.example.com/realms/YourRealm/protocol/openid-connect/auth
+  ?client_id=spark-session-operator
+  &redirect_uri=https://spark-api.example.com/callback
+  &response_type=code
+  &scope=openid+profile+email
+```
+
+**For scripts / CI** — obtain the token programmatically via curl:
+```sh
+TOKEN=$(curl -s -X POST \
+  "https://keycloak.example.com/realms/YourRealm/protocol/openid-connect/token" \
+  -d "grant_type=password&client_id=spark-session-operator" \
+  -d "username=alice&password=my-password" | jq -r .access_token)
+
+curl -H "Authorization: Bearer $TOKEN" \
+  https://spark-api.example.com/api/v1/pools
+```
+
+With `--oidc-skip-validation` enabled, any valid-looking JWT is accepted without signature verification.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -231,24 +298,52 @@ All endpoints require an `Authorization: Bearer <token>` header.
 | `GET` | `/api/v1/sessions/{name}` | Get session details |
 | `DELETE` | `/api/v1/sessions/{name}` | Terminate a session |
 
-Unauthenticated health endpoints:
+Unauthenticated endpoints (no token required):
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `GET` | `/api/v1/pools` | List all pools (replicas, ready count, active sessions) |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe |
 
+### Pool response
+
+Returned by `GET /api/v1/pools`.
+
+```json
+[
+  {
+    "name": "connect-default-pool",
+    "type": "connect",
+    "host": "spark-connect-default.example.com",
+    "minReplicas": 0,
+    "maxReplicas": 5,
+    "currentReplicas": 2,
+    "readyReplicas": 2,
+    "totalActiveSessions": 3,
+    "sessionPolicy": {
+      "maxSessionsPerUser": 5,
+      "maxTotalSessions": 200,
+      "idleTimeoutMinutes": 720,
+      "defaultSessionConf": {
+        "spark.executor.memory": "4g"
+      }
+    }
+  }
+]
+```
+
 ### Session response
 
-Returned by GET and DELETE endpoints.
+Returned by `GET` and `DELETE` session endpoints.
 
 ```json
 {
   "name": "session-alice-12345",
   "user": "alice",
-  "pool": "connect-pool",
+  "pool": "connect-default-pool",
   "state": "Active",
-  "assignedInstance": "connect-pool-54321",
+  "assignedInstance": "connect-default-pool-54321",
   "createdAt": "2026-02-25T10:00:00Z",
   "lastActivityAt": "2026-02-25T10:05:00Z"
 }
@@ -262,12 +357,13 @@ Returned by GET and DELETE endpoints.
 apiVersion: sparkinteractive.io/v1alpha1
 kind: SparkSessionPool
 metadata:
-  name: connect-pool
+  name: connect-default-pool
   namespace: spark-dev
 spec:
   type: connect                    # "connect" or "thrift"
+  host: spark-connect-default.example.com  # Hostname for Ingress routing
   replicas:
-    min: 1                         # Minimum running instances
+    min: 0                         # Minimum instances (0 = scale from zero)
     max: 5                         # Maximum instances
   scaling:
     metrics:
@@ -303,7 +399,7 @@ The `spec.scaling.metrics.type` field selects a single metric for autoscaling. O
 
 For `cpu` and `memory`, the controller reads driver pod resource usage from the Metrics API and compares it against resource requests. The desired replica count follows the HPA formula: `ceil(currentReplicas * avgUtilization / target)`. This requires [Metrics Server](https://github.com/kubernetes-sigs/metrics-server) (or an equivalent `metrics.k8s.io` provider) to be installed in the cluster.
 
-For `activeSessions`, the controller counts active/idle SparkInteractiveSession CRs assigned to each instance. The `scaleUpThreshold` adds headroom: if the average load per instance exceeds `target * scaleUpThreshold`, an extra replica is added.
+For `activeSessions`, the controller counts active/idle SparkInteractiveSession CRs assigned to each instance, plus pending sessions not yet assigned (for scale-from-zero). The `scaleUpThreshold` adds headroom: if the average load per instance exceeds `target * scaleUpThreshold`, an extra replica is added.
 
 ### SparkInteractiveSession
 
@@ -315,7 +411,7 @@ metadata:
   namespace: spark-dev
 spec:
   user: alice
-  pool: connect-pool
+  pool: connect-default-pool
   sparkConf:
     spark.executor.memory: "8g"
 ```
@@ -342,6 +438,15 @@ make generate manifests
 CGO_ENABLED=0 go build -o bin/manager cmd/main.go
 ```
 
+### Regenerate architecture diagram
+
+Requires [Graphviz](https://graphviz.org/):
+
+```sh
+dot -Tpng docs/architecture.dot -o docs/architecture.png -Gdpi=150
+dot -Tsvg docs/architecture.dot -o docs/architecture.svg
+```
+
 ### Run tests
 
 ```sh
@@ -360,18 +465,22 @@ make test
 ├── internal/
 │   ├── auth/token.go              # Shared OIDC auth + Keycloak ROPC
 │   ├── controller/                # Reconciliation logic
-│   │   ├── sparksessionpool_controller.go
-│   │   └── sparkinteractivesession_controller.go
+│   │   ├── sparksessionpool_controller.go      # Pool scaling, Ingress, lifecycle
+│   │   └── sparkinteractivesession_controller.go  # Session assignment, timeout
 │   ├── gateway/server.go          # REST API gateway (read + delete)
 │   └── proxy/                     # Auto-session proxies
-│       ├── proxy.go               # Session lifecycle + keepalive
-│       ├── thrift_sasl.go         # SASL PLAIN frame parser
-│       └── connect_grpc.go        # gRPC metadata extraction + raw codec
+│       ├── proxy.go               # Session lifecycle, Thrift HTTP proxy, Connect gRPC proxy
+│       └── connect_grpc.go        # gRPC credential extraction + raw codec
 ├── config/
 │   ├── crd/bases/                 # Generated CRD YAMLs
+│   ├── default/                   # Kustomize overlays (ingress, service, patches)
 │   ├── manager/manager.yaml       # Deployment manifest
 │   ├── rbac/                      # Generated RBAC from markers
-│   └── samples/                   # Example CRs
+│   └── samples/                   # Example pool and session CRs
+├── docs/
+│   ├── architecture.dot           # Graphviz source for architecture diagram
+│   ├── architecture.png           # Rendered diagram (PNG)
+│   └── architecture.svg           # Rendered diagram (SVG)
 ├── Dockerfile
 ├── Makefile
 └── PROJECT                        # Kubebuilder project metadata

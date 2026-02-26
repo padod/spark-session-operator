@@ -76,12 +76,12 @@ func (g *SessionGateway) Start(addr string) error {
 	api := router.PathPrefix("/api/v1").Subrouter()
 	api.Use(g.authMiddleware)
 
-	api.HandleFunc("/pools", g.listPools).Methods("GET")
 	api.HandleFunc("/sessions", g.listSessions).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.getSession).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.deleteSession).Methods("DELETE")
 
-	// Health endpoints (no auth)
+	// Public endpoints (no auth)
+	router.HandleFunc("/api/v1/pools", g.listPools).Methods("GET")
 	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("ok"))
