@@ -112,8 +112,8 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
-	// Count sessions per instance
-	sessionCounts, err := r.countSessionsPerInstance(ctx, pool)
+	// Count sessions per instance and pending (unassigned) sessions
+	sessionCounts, pendingSessions, err := r.countSessionsPerInstance(ctx, pool)
 	if err != nil {
 		log.Error(err, "Failed to count sessions")
 		return ctrl.Result{}, err
@@ -140,13 +140,13 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		totalSessions += inst.ActiveSessions
 	}
 
-	desiredReplicas := r.calculateDesiredReplicas(ctx, pool, currentReady, totalSessions, instanceStatuses)
+	desiredReplicas := r.calculateDesiredReplicas(ctx, pool, currentReady, totalSessions, pendingSessions, instanceStatuses)
 
 	// Scale up if needed (count pending instances to avoid creating duplicates while Spark apps are starting)
 	currentTotal := currentRunning + currentPending
 	if currentTotal < desiredReplicas {
 		toCreate := desiredReplicas - currentTotal
-		log.Info("Scaling up", "current", currentRunning, "pending", currentPending, "desired", desiredReplicas, "creating", toCreate)
+		log.Info("Scaling up", "current", currentRunning, "pending", currentPending, "desired", desiredReplicas, "creating", toCreate, "pendingSessions", pendingSessions)
 		for i := int32(0); i < toCreate; i++ {
 			if err := r.createPoolInstance(ctx, log, pool, existingApps); err != nil {
 				log.Error(err, "Failed to create pool instance")
@@ -199,12 +199,16 @@ func (r *SparkSessionPoolReconciler) calculateDesiredReplicas(
 	pool *sparkv1alpha1.SparkSessionPool,
 	currentReady int32,
 	totalSessions int32,
+	pendingSessions int32,
 	instances []sparkv1alpha1.PoolInstanceStatus,
 ) int32 {
 	metricsType := pool.Spec.Scaling.Metrics.Type
 	if metricsType == "" {
 		metricsType = "activeSessions"
 	}
+
+	// Include pending (unassigned) sessions in the total so we scale from zero.
+	effectiveSessions := totalSessions + pendingSessions
 
 	var desired int32
 
@@ -227,14 +231,20 @@ func (r *SparkSessionPoolReconciler) calculateDesiredReplicas(
 			desired = int32(math.Ceil(float64(currentReady) * avgUtil / target))
 		}
 
+		// Even for cpu/memory scaling, if there are pending sessions and no instances,
+		// we need at least one instance to serve them.
+		if pendingSessions > 0 && desired == 0 {
+			desired = 1
+		}
+
 	default: // "activeSessions"
 		target := pool.Spec.Scaling.Metrics.TargetPerInstance
 		if target <= 0 {
 			target = 20
 		}
 
-		if totalSessions > 0 {
-			desired = (totalSessions + target - 1) / target // ceiling division
+		if effectiveSessions > 0 {
+			desired = (effectiveSessions + target - 1) / target // ceiling division
 		} else {
 			desired = pool.Spec.Replicas.Min
 		}
@@ -247,7 +257,7 @@ func (r *SparkSessionPoolReconciler) calculateDesiredReplicas(
 
 		// If current load exceeds threshold, add headroom
 		if currentReady > 0 {
-			loadPerInstance := float64(totalSessions) / float64(currentReady)
+			loadPerInstance := float64(effectiveSessions) / float64(currentReady)
 			if loadPerInstance > float64(target)*scaleUpThreshold {
 				desired = currentReady + 1
 			}
@@ -464,22 +474,29 @@ func (r *SparkSessionPoolReconciler) listPoolInstances(
 func (r *SparkSessionPoolReconciler) countSessionsPerInstance(
 	ctx context.Context,
 	pool *sparkv1alpha1.SparkSessionPool,
-) (map[string]int32, error) {
+) (map[string]int32, int32, error) {
 	sessionList := &sparkv1alpha1.SparkInteractiveSessionList{}
 	if err := r.List(ctx, sessionList,
 		client.InNamespace(pool.Namespace),
 		client.MatchingFields{"spec.pool": pool.Name},
 	); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	counts := make(map[string]int32)
+	var pendingSessions int32
 	for _, session := range sessionList.Items {
-		if session.Status.State == "Active" || session.Status.State == "Idle" {
+		switch session.Status.State {
+		case "Active", "Idle":
 			counts[session.Status.AssignedInstance]++
+		case "Pending", "":
+			// Sessions not yet assigned to an instance (scale-from-zero trigger)
+			if session.Status.AssignedInstance == "" {
+				pendingSessions++
+			}
 		}
 	}
-	return counts, nil
+	return counts, pendingSessions, nil
 }
 
 func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
