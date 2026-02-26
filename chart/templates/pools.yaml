@@ -1,0 +1,10 @@
+{{- range .Values.pools }}
+---
+apiVersion: sparkinteractive.io/v1alpha1
+kind: SparkSessionPool
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.namespace }}
+spec:
+  {{- toYaml .spec | nindent 2 }}
+{{- end }}

@@ -1,0 +1,52 @@
+image:
+  repository: fnr-dev-team-docker-repo.repo.corp.tander.ru/spark-session-operator
+  tag: latest
+  pullPolicy: Always
+
+# Namespace where SparkSessionPools and sessions live (--namespace flag)
+namespace: spark-dev
+
+# Override proxy namespace (--proxy-namespace flag). Defaults to release namespace.
+proxyNamespace: ""
+
+replicaCount: 1
+
+oidc:
+  issuerUrl: ""
+  audience: ""
+  clientId: ""
+  clientSecret: ""
+  userClaim: sub
+  groupsClaim: groups
+  skipValidation: false
+
+gateway:
+  # Set to enable gateway Ingress (e.g. spark-api.example.com). Empty = no Ingress.
+  host: ""
+  ingressClassName: nginx
+  annotations: {}
+
+leaderElect: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+
+# Pool definitions. Each entry creates a SparkSessionPool CR in .Values.namespace.
+# Override in env-specific values file (k8s_infra).
+pools: []
+# - name: connect-default-pool
+#   spec:
+#     type: connect
+#     host: spark-connect-default.example.com
+#     replicas: { min: 0, max: 5 }
+#     scaling: { ... }
+#     sparkApplicationTemplate: { ... }
+#     sessionPolicy: { ... }
