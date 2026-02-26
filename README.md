@@ -29,7 +29,7 @@ Each pool defines a `spec.host` field (e.g. `spark-connect-default.example.com`)
 | `connect` | gRPC proxy | GRPC | 15002 |
 | `thrift`  | Thrift HTTP proxy | HTTP | 10009 |
 
-This allows multiple pools of the same type (e.g. `connect-default-pool` and `connect-heavy-pool`) to coexist. The proxy selects the target pool by hostname: the Thrift HTTP proxy uses the standard `Host` header (preserved by nginx for HTTP backends), while the Connect gRPC proxy reads `X-Forwarded-Host` from gRPC metadata (nginx rewrites `:authority` for gRPC backends, so a `configuration-snippet` annotation injects the original host).
+This allows multiple pools of the same type (e.g. `connect-default-pool` and `connect-heavy-pool`) to coexist. The proxy selects the target pool by hostname: the Thrift HTTP proxy uses the standard `Host` header (preserved by nginx for HTTP backends), while the Connect gRPC proxy reads `X-Forwarded-Host` from gRPC metadata (nginx ingress automatically sets `grpc_set_header x-forwarded-host` for gRPC backends).
 
 ### Scale from zero
 
@@ -302,7 +302,7 @@ Unauthenticated endpoints (no token required):
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/v1/pools` | List all pools (replicas, ready count, active sessions) |
+| `GET` | `/api/v1/pools` | List all pools (HTML table in browser, JSON for programmatic access; `?format=json` forces JSON) |
 | `GET` | `/healthz` | Liveness probe |
 | `GET` | `/readyz` | Readiness probe |
 
@@ -481,6 +481,8 @@ make test
 │   ├── architecture.dot           # Graphviz source for architecture diagram
 │   ├── architecture.png           # Rendered diagram (PNG)
 │   └── architecture.svg           # Rendered diagram (SVG)
+├── scripts/
+│   └── test_thrift.py             # PyHive test script for Thrift HTTP transport
 ├── Dockerfile
 ├── Makefile
 └── PROJECT                        # Kubebuilder project metadata
