@@ -35,6 +35,7 @@ spec:
         spark.hadoop.hive.server2.transport.mode: "http"
         spark.hadoop.hive.server2.thrift.http.port: "10001"
         spark.hadoop.hive.server2.thrift.http.path: "cliservice"
+        spark.hadoop.hive.server2.authentication: "NONE"
         spark.dynamicAllocation.enabled: "true"
         spark.dynamicAllocation.initialExecutors: "1"
         spark.dynamicAllocation.maxExecutors: "10"

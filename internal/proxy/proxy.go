@@ -370,7 +370,7 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 	// Replace the proxy credentials with the authenticated username
 	// so the backend sees who the user is without receiving their Keycloak password.
 	backendAuth := "Basic " + base64.StdEncoding.EncodeToString(
-		[]byte(userInfo.Username+":"),
+		[]byte(userInfo.Username+":x"),
 	)
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
