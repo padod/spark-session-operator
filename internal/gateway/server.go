@@ -179,7 +179,93 @@ func (g *SessionGateway) listPools(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Return HTML table for browsers, JSON for programmatic access.
+	// ?format=json forces JSON even from a browser.
+	if r.URL.Query().Get("format") != "json" && strings.Contains(r.Header.Get("Accept"), "text/html") {
+		g.writePoolsHTML(w, responses)
+		return
+	}
 	g.writeJSON(w, http.StatusOK, responses)
+}
+
+func (g *SessionGateway) writePoolsHTML(w http.ResponseWriter, pools []PoolResponse) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprint(w, `<!DOCTYPE html>
+<html><head>
+<title>Spark Session Pools</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px; background: #f8f9fa; }
+  h1 { color: #1a1a1a; font-size: 1.4em; }
+  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #e9ecef; font-size: 0.9em; }
+  th { background: #495057; color: #fff; font-weight: 600; }
+  tr:hover { background: #f1f3f5; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }
+  .tag-connect { background: #dbeafe; color: #1e40af; }
+  .tag-thrift { background: #fef3c7; color: #92400e; }
+  .ready { color: #16a34a; font-weight: 600; }
+  .not-ready { color: #dc2626; font-weight: 600; }
+  .zero { color: #9ca3af; }
+  .host { font-family: monospace; font-size: 0.85em; }
+  .ts { color: #6b7280; font-size: 0.8em; margin-top: 12px; }
+</style>
+</head><body>
+<h1>Spark Session Pools</h1>
+<table>
+<tr>
+  <th>Pool</th>
+  <th>Type</th>
+  <th>Host</th>
+  <th>Replicas</th>
+  <th>Ready</th>
+  <th>Sessions</th>
+  <th>Max/User</th>
+  <th>Max Total</th>
+  <th>Idle Timeout</th>
+</tr>`)
+
+	for _, p := range pools {
+		typeClass := "tag-connect"
+		if p.Type == "thrift" {
+			typeClass = "tag-thrift"
+		}
+		readyClass := "ready"
+		if p.ReadyReplicas == 0 {
+			readyClass = "zero"
+		}
+		if p.ReadyReplicas < p.CurrentReplicas {
+			readyClass = "not-ready"
+		}
+		sessClass := ""
+		if p.TotalActiveSessions == 0 {
+			sessClass = "zero"
+		}
+		fmt.Fprintf(w, `<tr>
+  <td><strong>%s</strong></td>
+  <td><span class="tag %s">%s</span></td>
+  <td class="host">%s</td>
+  <td>%d / %d..%d</td>
+  <td class="%s">%d</td>
+  <td class="%s">%d</td>
+  <td>%d</td>
+  <td>%d</td>
+  <td>%dmin</td>
+</tr>`,
+			p.Name, typeClass, p.Type, p.Host,
+			p.CurrentReplicas, p.MinReplicas, p.MaxReplicas,
+			readyClass, p.ReadyReplicas,
+			sessClass, p.TotalActiveSessions,
+			p.SessionPolicy.MaxSessionsPerUser,
+			p.SessionPolicy.MaxTotalSessions,
+			p.SessionPolicy.IdleTimeoutMinutes,
+		)
+	}
+
+	fmt.Fprintf(w, `</table>
+<p class="ts">Auto-refreshes every 30s. <a href="/api/v1/pools?format=json" style="color:#3b82f6;">JSON</a></p>
+</body></html>`)
 }
 
 func (g *SessionGateway) listSessions(w http.ResponseWriter, r *http.Request) {
