@@ -5,9 +5,9 @@ metadata:
   namespace: spark-dev
 spec:
   type: connect
-  host: spark-connect.fnr-dev-i.corp.tander.ru
+  host: spark-connect-default.fnr-dev-i.corp.tander.ru
   replicas:
-    min: 1
+    min: 0
     max: 5
   scaling:
     metrics:

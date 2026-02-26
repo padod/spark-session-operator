@@ -21,6 +21,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -43,7 +46,6 @@ const (
 	sessionPollInterval = 500 * time.Millisecond
 	sessionPollTimeout  = 60 * time.Second
 	keepaliveInterval   = 2 * time.Minute
-	backendDialTimeout  = 10 * time.Second
 )
 
 // SessionProxy handles incoming Thrift and gRPC connections, auto-creating sessions
@@ -57,6 +59,9 @@ type SessionProxy struct {
 	// sessions tracks user+pool → session name to avoid races
 	// when multiple RPCs arrive before the informer cache updates.
 	sessions sync.Map // key: "user:pool", value: string (session name)
+
+	// endpoints caches session → resolved endpoint URL to avoid re-polling on every HTTP request.
+	endpoints sync.Map // key: session name, value: string (endpoint)
 }
 
 // NewSessionProxy creates a new proxy.
@@ -260,119 +265,137 @@ func (p *SessionProxy) updateLastActivity(ctx context.Context, sessionName strin
 	return nil
 }
 
-// StartThriftProxy starts the TCP listener for Thrift connections.
-func (p *SessionProxy) StartThriftProxy(addr string) error {
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("listen on %s: %w", addr, err)
+// StartThriftHTTPProxy starts an HTTP server that reverse-proxies Thrift HTTP transport requests.
+func (p *SessionProxy) StartThriftHTTPProxy(addr string) error {
+	server := &http.Server{
+		Addr:    addr,
+		Handler: http.HandlerFunc(p.handleThriftHTTPRequest),
 	}
 
-	p.log.Info("Starting Thrift proxy", "addr", addr)
+	p.log.Info("Starting Thrift HTTP proxy", "addr", addr)
 
 	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				p.log.Error(err, "Failed to accept Thrift connection")
-				continue
-			}
-			go p.handleThriftConnection(conn)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			p.log.Error(err, "Thrift HTTP proxy failed")
 		}
 	}()
 
 	return nil
 }
 
-// handleThriftConnection handles a single Thrift client connection.
-func (p *SessionProxy) handleThriftConnection(clientConn net.Conn) {
-	defer clientConn.Close()
+// handleThriftHTTPRequest handles a single Thrift HTTP transport request.
+// It mirrors the handleConnectStream logic: extract creds from Authorization header,
+// authenticate, route by Host header, find/create session, reverse proxy to backend.
+func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 
-	remoteAddr := clientConn.RemoteAddr().String()
-	p.log.V(1).Info("New Thrift connection", "remote", remoteAddr)
-
-	ctx := context.Background()
-
-	// 1. Extract SASL credentials
-	saslAuth, rawBytes, err := ExtractThriftSASLAuth(clientConn)
+	// 1. Parse Basic auth from Authorization header
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		http.Error(w, "missing Authorization header", http.StatusUnauthorized)
+		return
+	}
+	username, password, err := parseBasicAuth(authHeader)
 	if err != nil {
-		p.log.Error(err, "SASL auth extraction failed", "remote", remoteAddr)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte(err.Error()))
+		p.log.Error(err, "Failed to parse Authorization header")
+		http.Error(w, "invalid Authorization header", http.StatusUnauthorized)
 		return
 	}
 
 	// 2. Authenticate via Keycloak ROPC
-	userInfo, err := p.auth.AuthenticateWithCredentials(ctx, saslAuth.Username, saslAuth.Password)
+	userInfo, err := p.auth.AuthenticateWithCredentials(ctx, username, password)
 	if err != nil {
-		p.log.Error(err, "Credential authentication failed", "user", saslAuth.Username, "remote", remoteAddr)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("authentication failed"))
+		p.log.Error(err, "Credential authentication failed", "user", username)
+		http.Error(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
 
-	p.log.Info("Thrift user authenticated", "user", userInfo.Username, "remote", remoteAddr)
+	p.log.Info("Thrift user authenticated", "user", userInfo.Username, "remote", r.RemoteAddr)
 
-	// 3. Find pool
-	poolName, err := p.findPool(ctx, "thrift")
-	if err != nil {
-		p.log.Error(err, "Failed to find thrift pool", "user", userInfo.Username)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte(err.Error()))
-		return
+	// 3. Find pool by Host header (hostname-based routing), fallback to single-pool lookup
+	host := r.Host
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		host = host[:idx]
+	}
+
+	var poolName string
+	if host != "" {
+		var poolType string
+		poolName, poolType, err = p.findPoolByHost(ctx, host)
+		if err != nil {
+			p.log.Error(err, "Failed to find pool by host", "host", host, "user", userInfo.Username)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if poolType != "thrift" {
+			p.log.Error(nil, "Pool matched by host is not a thrift pool", "host", host, "poolType", poolType)
+			http.Error(w, fmt.Sprintf("pool %q is type %q, expected thrift", poolName, poolType), http.StatusBadRequest)
+			return
+		}
+	} else {
+		poolName, err = p.findPool(ctx, "thrift")
+		if err != nil {
+			p.log.Error(err, "Failed to find thrift pool", "user", userInfo.Username)
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	// 4. Find existing or create new session
 	sessionName, err := p.findOrCreateSession(ctx, userInfo.Username, poolName)
 	if err != nil {
 		p.log.Error(err, "Failed to find/create session", "user", userInfo.Username, "pool", poolName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("failed to create session"))
+		http.Error(w, "failed to create session", http.StatusInternalServerError)
 		return
 	}
 
-	// 5. Wait for session to become active
-	endpoint, err := p.waitForSessionActive(ctx, sessionName)
+	// 5. Resolve endpoint (use cache to avoid re-polling on every request)
+	endpoint, err := p.resolveEndpoint(ctx, sessionName)
 	if err != nil {
 		p.log.Error(err, "Session did not become active", "session", sessionName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("session failed to start"))
+		http.Error(w, "session failed to start", http.StatusServiceUnavailable)
 		return
 	}
 
-	// 6. Connect to backend
-	backendConn, err := net.DialTimeout("tcp", endpoint, backendDialTimeout)
+	// 6. Reverse proxy to backend
+	backendURL := &url.URL{
+		Scheme: "http",
+		Host:   endpoint,
+	}
+	rp := &httputil.ReverseProxy{
+		Director: func(req *http.Request) {
+			req.URL.Scheme = backendURL.Scheme
+			req.URL.Host = backendURL.Host
+			req.URL.Path = "/cliservice"
+			req.Host = backendURL.Host
+			// Remove the Authorization header — backend doesn't need proxy creds
+			req.Header.Del("Authorization")
+		},
+	}
+
+	p.log.V(1).Info("Thrift HTTP proxying request", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint)
+
+	// 7. Update activity per-request (no background keepalive needed for HTTP)
+	if err := p.updateLastActivity(ctx, sessionName); err != nil {
+		p.log.Error(err, "Failed to update activity", "session", sessionName)
+	}
+
+	rp.ServeHTTP(w, r)
+}
+
+// resolveEndpoint returns a cached endpoint for the session, or waits for it to become active.
+func (p *SessionProxy) resolveEndpoint(ctx context.Context, sessionName string) (string, error) {
+	if cached, ok := p.endpoints.Load(sessionName); ok {
+		return cached.(string), nil
+	}
+
+	endpoint, err := p.waitForSessionActive(ctx, sessionName)
 	if err != nil {
-		p.log.Error(err, "Failed to connect to backend", "endpoint", endpoint, "session", sessionName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("backend connection failed"))
-		return
-	}
-	defer backendConn.Close()
-
-	// 7. Replay raw SASL bytes to backend
-	if _, err := backendConn.Write(rawBytes); err != nil {
-		p.log.Error(err, "Failed to replay SASL to backend", "session", sessionName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("backend handshake failed"))
-		return
+		return "", err
 	}
 
-	// Read backend SASL COMPLETE
-	backendStatus, _, _, err := readSASLFrame(backendConn)
-	if err != nil {
-		p.log.Error(err, "Failed to read backend SASL response", "session", sessionName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("backend handshake failed"))
-		return
-	}
-	if backendStatus != saslComplete {
-		p.log.Error(nil, "Backend SASL handshake failed", "status", backendStatus, "session", sessionName)
-		_ = writeSASLFrame(clientConn, saslERROR, []byte("backend authentication failed"))
-		return
-	}
-
-	// 8. Forward SASL COMPLETE to client
-	if err := CompleteSASLHandshake(clientConn); err != nil {
-		p.log.Error(err, "Failed to send SASL COMPLETE to client", "session", sessionName)
-		return
-	}
-
-	p.log.Info("Thrift session proxying started", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint)
-
-	// 9. Bidirectional proxy with keepalive
-	p.proxyWithKeepalive(clientConn, backendConn, sessionName)
+	p.endpoints.Store(sessionName, endpoint)
+	return endpoint, nil
 }
 
 // StartConnectProxy starts the gRPC server for Spark Connect connections.
@@ -583,30 +606,6 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	}
 
 	return nil
-}
-
-// proxyWithKeepalive runs bidirectional TCP copy with periodic keepalive updates.
-func (p *SessionProxy) proxyWithKeepalive(clientConn, backendConn net.Conn, sessionName string) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Start keepalive goroutine
-	go p.runKeepalive(ctx, sessionName)
-
-	// Bidirectional copy
-	done := make(chan struct{}, 2)
-	go func() {
-		_, _ = io.Copy(backendConn, clientConn)
-		done <- struct{}{}
-	}()
-	go func() {
-		_, _ = io.Copy(clientConn, backendConn)
-		done <- struct{}{}
-	}()
-
-	// Wait for either direction to close
-	<-done
-	p.log.Info("Thrift session proxy closed", "session", sessionName)
 }
 
 // runKeepalive periodically updates LastActivityAt for the session.

@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"reflect"
 	"strconv"
 	"strings"
 	"time"
@@ -56,9 +57,10 @@ var sparkAppGVR = schema.GroupVersionResource{
 // SparkSessionPoolReconciler reconciles a SparkSessionPool object
 type SparkSessionPoolReconciler struct {
 	client.Client
-	Scheme        *runtime.Scheme
-	Log           logr.Logger
-	MetricsClient metricsv.Interface
+	Scheme         *runtime.Scheme
+	Log            logr.Logger
+	MetricsClient  metricsv.Interface
+	ProxyNamespace string // Namespace where the proxy Service lives (for Ingress creation)
 }
 
 // +kubebuilder:rbac:groups=sparkinteractive.io,resources=sparksessionpools,verbs=get;list;watch;create;update;patch;delete
@@ -90,8 +92,9 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 
 	// Ensure finalizer
 	if !controllerutil.ContainsFinalizer(pool, poolFinalizer) {
+		patch := client.MergeFrom(pool.DeepCopy())
 		controllerutil.AddFinalizer(pool, poolFinalizer)
-		if err := r.Update(ctx, pool); err != nil {
+		if err := r.Patch(ctx, pool, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -572,47 +575,112 @@ func (r *SparkSessionPoolReconciler) handleDeletion(
 			}
 		}
 
+		// Delete the Ingress created for this pool (cross-namespace, no ownerRef GC)
+		if err := r.deletePoolIngress(ctx, log, pool); err != nil {
+			log.Error(err, "Failed to delete pool Ingress")
+		}
+
+		patch := client.MergeFrom(pool.DeepCopy())
 		controllerutil.RemoveFinalizer(pool, poolFinalizer)
-		if err := r.Update(ctx, pool); err != nil {
+		if err := r.Patch(ctx, pool, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	return ctrl.Result{}, nil
 }
 
-// reconcileIngress creates or updates an Ingress for connect pools to enable hostname-based routing.
+// deletePoolIngress deletes the Ingress associated with a pool.
+func (r *SparkSessionPoolReconciler) deletePoolIngress(
+	ctx context.Context,
+	log logr.Logger,
+	pool *sparkv1alpha1.SparkSessionPool,
+) error {
+	ingressNamespace := r.ProxyNamespace
+	if ingressNamespace == "" {
+		ingressNamespace = pool.Namespace
+	}
+
+	var suffix string
+	switch pool.Spec.Type {
+	case "connect":
+		suffix = "-connect"
+	case "thrift":
+		suffix = "-thrift"
+	default:
+		return nil
+	}
+
+	ingress := &networkingv1.Ingress{}
+	key := client.ObjectKey{Namespace: ingressNamespace, Name: pool.Name + suffix}
+	if err := r.Get(ctx, key, ingress); err != nil {
+		if errors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+
+	log.Info("Deleting Ingress for pool", "ingress", ingress.Name, "namespace", ingressNamespace)
+	return r.Delete(ctx, ingress)
+}
+
+// reconcileIngress creates or updates an Ingress for pools to enable hostname-based routing.
 func (r *SparkSessionPoolReconciler) reconcileIngress(
 	ctx context.Context,
 	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 ) error {
-	if pool.Spec.Type != "connect" {
-		return nil // Only connect pools get auto-Ingress for now
+	var ingressSuffix string
+	var backendProtocol string
+	var backendPort int32
+	extraAnnotations := map[string]string{}
+
+	switch pool.Spec.Type {
+	case "connect":
+		ingressSuffix = "-connect"
+		backendProtocol = "GRPC"
+		backendPort = 15002
+	case "thrift":
+		ingressSuffix = "-thrift"
+		backendProtocol = "HTTP"
+		backendPort = 10009
+		extraAnnotations["nginx.ingress.kubernetes.io/proxy-body-size"] = "0"
+		extraAnnotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = "3600"
+		extraAnnotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = "3600"
+	default:
+		return nil // Unknown pool type — skip ingress
 	}
 
-	ingressName := pool.Name + "-connect"
+	// Ingress must live in the same namespace as the proxy Service.
+	ingressNamespace := r.ProxyNamespace
+	if ingressNamespace == "" {
+		ingressNamespace = pool.Namespace // fallback if ProxyNamespace not configured
+	}
+
+	ingressName := pool.Name + ingressSuffix
 	pathType := networkingv1.PathTypePrefix
 
 	const proxyServiceName = "spark-session-operator-proxy"
 
+	annotations := map[string]string{
+		"nginx.ingress.kubernetes.io/backend-protocol": backendProtocol,
+		"yandex.cloud/load-balancer-type":              "internal",
+	}
+	for k, v := range extraAnnotations {
+		annotations[k] = v
+	}
+
+	// Cross-namespace ownerReferences are not allowed, so we use labels to track
+	// which pool owns this Ingress. Cleanup happens in handleDeletion.
 	desired := &networkingv1.Ingress{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      ingressName,
-			Namespace: pool.Namespace,
+			Namespace: ingressNamespace,
 			Labels: map[string]string{
-				"sparkinteractive.io/pool":       pool.Name,
-				"sparkinteractive.io/managed-by": "spark-session-operator",
+				"sparkinteractive.io/pool":           pool.Name,
+				"sparkinteractive.io/pool-namespace": pool.Namespace,
+				"sparkinteractive.io/managed-by":     "spark-session-operator",
 			},
-			Annotations: map[string]string{
-				"nginx.ingress.kubernetes.io/backend-protocol": "GRPC",
-			},
-			OwnerReferences: []metav1.OwnerReference{{
-				APIVersion: pool.APIVersion,
-				Kind:       pool.Kind,
-				Name:       pool.Name,
-				UID:        pool.UID,
-				Controller: boolPtr(true),
-			}},
+			Annotations: annotations,
 		},
 		Spec: networkingv1.IngressSpec{
 			IngressClassName: stringPtr("nginx"),
@@ -626,7 +694,7 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 							Backend: networkingv1.IngressBackend{
 								Service: &networkingv1.IngressServiceBackend{
 									Name: proxyServiceName,
-									Port: networkingv1.ServiceBackendPort{Number: 15002},
+									Port: networkingv1.ServiceBackendPort{Number: backendPort},
 								},
 							},
 						}},
@@ -637,21 +705,26 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 	}
 
 	existing := &networkingv1.Ingress{}
-	err := r.Get(ctx, client.ObjectKey{Namespace: pool.Namespace, Name: ingressName}, existing)
+	err := r.Get(ctx, client.ObjectKey{Namespace: ingressNamespace, Name: ingressName}, existing)
 	if errors.IsNotFound(err) {
-		log.Info("Creating Ingress for pool", "ingress", ingressName, "host", pool.Spec.Host)
+		log.Info("Creating Ingress for pool", "ingress", ingressName, "namespace", ingressNamespace, "host", pool.Spec.Host)
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
 		return fmt.Errorf("get ingress %s: %w", ingressName, err)
 	}
 
-	// Update spec and annotations if changed
+	// Only update if something actually changed
+	if reflect.DeepEqual(existing.Spec, desired.Spec) &&
+		reflect.DeepEqual(existing.Labels, desired.Labels) &&
+		reflect.DeepEqual(existing.Annotations, desired.Annotations) {
+		return nil
+	}
+
 	existing.Spec = desired.Spec
 	existing.Labels = desired.Labels
 	existing.Annotations = desired.Annotations
-	existing.OwnerReferences = desired.OwnerReferences
-	log.V(1).Info("Updating Ingress for pool", "ingress", ingressName, "host", pool.Spec.Host)
+	log.V(1).Info("Updating Ingress for pool", "ingress", ingressName, "namespace", ingressNamespace, "host", pool.Spec.Host)
 	return r.Update(ctx, existing)
 }
 

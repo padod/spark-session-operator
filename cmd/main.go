@@ -89,6 +89,7 @@ func main() {
 	// Custom operator flags
 	var (
 		namespace          string
+		proxyNamespace     string
 		gatewayAddr        string
 		thriftProxyAddr    string
 		connectProxyAddr   string
@@ -100,9 +101,10 @@ func main() {
 		oidcClientID       string
 		oidcClientSecret   string
 	)
-	flag.StringVar(&namespace, "namespace", "spark-dev", "Namespace to operate in.")
+	flag.StringVar(&namespace, "namespace", "spark-dev", "Namespace where pools and sessions live.")
+	flag.StringVar(&proxyNamespace, "proxy-namespace", "spark-session-operator", "Namespace where the proxy Service and Ingresses live.")
 	flag.StringVar(&gatewayAddr, "gateway-addr", ":8080", "Address for the REST API gateway.")
-	flag.StringVar(&thriftProxyAddr, "thrift-proxy-addr", ":10009", "Address for the Thrift TCP proxy.")
+	flag.StringVar(&thriftProxyAddr, "thrift-proxy-addr", ":10009", "Address for the Thrift HTTP proxy.")
 	flag.StringVar(&connectProxyAddr, "connect-proxy-addr", ":15002", "Address for the Spark Connect gRPC proxy.")
 	flag.StringVar(&oidcIssuerURL, "oidc-issuer-url", "", "OIDC issuer URL for token validation.")
 	flag.StringVar(&oidcAudience, "oidc-audience", "", "Expected OIDC audience.")
@@ -193,10 +195,11 @@ func main() {
 
 	// Setup controllers
 	if err := (&controller.SparkSessionPoolReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Log:           ctrl.Log.WithName("controllers").WithName("SparkSessionPool"),
-		MetricsClient: metricsClientset,
+		Client:         mgr.GetClient(),
+		Scheme:         mgr.GetScheme(),
+		Log:            ctrl.Log.WithName("controllers").WithName("SparkSessionPool"),
+		MetricsClient:  metricsClientset,
+		ProxyNamespace: proxyNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "SparkSessionPool")
 		os.Exit(1)
@@ -248,7 +251,7 @@ func main() {
 	// Start proxies
 	sessionProxy := proxy.NewSessionProxy(mgr.GetClient(), ctrl.Log, namespace, authenticator)
 	if thriftProxyAddr != "" {
-		if err := sessionProxy.StartThriftProxy(thriftProxyAddr); err != nil {
+		if err := sessionProxy.StartThriftHTTPProxy(thriftProxyAddr); err != nil {
 			setupLog.Error(err, "failed to start thrift proxy")
 			os.Exit(1)
 		}

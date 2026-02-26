@@ -5,9 +5,9 @@ metadata:
   namespace: spark-dev
 spec:
   type: thrift
-  host: spark-thrift.fnr-dev-i.corp.tander.ru
+  host: spark-thrift-default.fnr-dev-i.corp.tander.ru
   replicas:
-    min: 1
+    min: 0
     max: 5
   scaling:
     metrics:
@@ -32,7 +32,9 @@ spec:
         spark.sql.hive.thriftServer.singleSession: "false"
         spark.sql.thriftServer.incrementalCollect: "true"
         spark.sql.thriftServer.defaultLimit: "10000"
-        spark.hadoop.hive.server2.thrift.port: "8972"
+        spark.hadoop.hive.server2.transport.mode: "http"
+        spark.hadoop.hive.server2.thrift.http.port: "10001"
+        spark.hadoop.hive.server2.thrift.http.path: "cliservice"
         spark.dynamicAllocation.enabled: "true"
         spark.dynamicAllocation.initialExecutors: "1"
         spark.dynamicAllocation.maxExecutors: "10"

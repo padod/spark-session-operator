@@ -317,7 +317,7 @@ func (r *SparkInteractiveSessionReconciler) assignToInstance(
 	port := ""
 	switch pool.Spec.Type {
 	case "thrift":
-		port = "8972" // TODO: make configurable from pool spec
+		port = "10001" // HiveServer2 HTTP transport port
 	case "connect":
 		port = "8424" // TODO: make configurable from pool spec
 	}
