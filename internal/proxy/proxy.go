@@ -18,6 +18,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"net"
@@ -365,14 +366,19 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 		Scheme: "http",
 		Host:   endpoint,
 	}
+	// HiveServer2 in HTTP transport mode requires an Authorization header.
+	// Replace the proxy credentials with the authenticated username
+	// so the backend sees who the user is without receiving their Keycloak password.
+	backendAuth := "Basic " + base64.StdEncoding.EncodeToString(
+		[]byte(userInfo.Username+":"),
+	)
 	rp := &httputil.ReverseProxy{
 		Director: func(req *http.Request) {
 			req.URL.Scheme = backendURL.Scheme
 			req.URL.Host = backendURL.Host
 			req.URL.Path = "/cliservice"
 			req.Host = backendURL.Host
-			// Remove the Authorization header — backend doesn't need proxy creds
-			req.Header.Del("Authorization")
+			req.Header.Set("Authorization", backendAuth)
 		},
 	}
 
