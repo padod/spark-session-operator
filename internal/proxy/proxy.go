@@ -312,8 +312,11 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 
 	p.log.Info("Thrift user authenticated", "user", userInfo.Username, "remote", r.RemoteAddr)
 
-	// 3. Find pool by Host header (hostname-based routing), fallback to single-pool lookup
-	host := r.Host
+	// 3. Find pool by hostname (prefer X-Forwarded-Host set by nginx, fallback to Host header)
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
 	if idx := strings.LastIndex(host, ":"); idx > 0 {
 		host = host[:idx]
 	}
@@ -460,32 +463,38 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 
 	p.log.Info("Connect user authenticated", "user", userInfo.Username)
 
-	// 4. Find pool by :authority header (hostname-based routing)
-	authority := ""
+	// 4. Find pool by hostname-based routing.
+	// Prefer x-forwarded-host (set by nginx ingress) over :authority,
+	// because nginx rewrites :authority to the upstream service name
+	// when proxying gRPC, losing the original client hostname.
+	host := ""
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if vals := md.Get(":authority"); len(vals) > 0 {
-			authority = vals[0]
+		if vals := md.Get("x-forwarded-host"); len(vals) > 0 {
+			host = vals[0]
+		} else if vals := md.Get(":authority"); len(vals) > 0 {
+			host = vals[0]
 		}
 	}
 	// Strip port if present
-	if idx := strings.LastIndex(authority, ":"); idx > 0 {
-		authority = authority[:idx]
+	if idx := strings.LastIndex(host, ":"); idx > 0 {
+		host = host[:idx]
 	}
+	p.log.V(1).Info("Connect routing", "host", host, "user", userInfo.Username)
 
 	var poolName string
-	if authority != "" {
+	if host != "" {
 		var poolType string
-		poolName, poolType, err = p.findPoolByHost(ctx, authority)
+		poolName, poolType, err = p.findPoolByHost(ctx, host)
 		if err != nil {
-			p.log.Error(err, "Failed to find pool by host", "authority", authority, "user", userInfo.Username)
+			p.log.Error(err, "Failed to find pool by host", "host", host, "user", userInfo.Username)
 			return status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
 		if poolType != "connect" {
-			p.log.Error(nil, "Pool matched by host is not a connect pool", "authority", authority, "poolType", poolType)
+			p.log.Error(nil, "Pool matched by host is not a connect pool", "host", host, "poolType", poolType)
 			return status.Errorf(codes.FailedPrecondition, "pool %q is type %q, expected connect", poolName, poolType)
 		}
 	} else {
-		// Fallback: no authority header, use legacy single-pool lookup
+		// Fallback: no host header, use legacy single-pool lookup
 		poolName, err = p.findPool(ctx, "connect")
 		if err != nil {
 			p.log.Error(err, "Failed to find connect pool", "user", userInfo.Username)

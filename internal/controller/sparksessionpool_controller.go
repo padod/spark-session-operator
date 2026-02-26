@@ -656,6 +656,10 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		ingressSuffix = "-connect"
 		backendProtocol = "GRPC"
 		backendPort = 15002
+		// Pass the original hostname so the proxy can route to the correct pool.
+		// nginx rewrites :authority to the upstream service name for gRPC,
+		// so we forward the original host via grpc_set_header.
+		extraAnnotations["nginx.ingress.kubernetes.io/configuration-snippet"] = "grpc_set_header x-forwarded-host $host;"
 	case "thrift":
 		ingressSuffix = "-thrift"
 		backendProtocol = "HTTP"
