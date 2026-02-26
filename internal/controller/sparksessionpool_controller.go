@@ -714,16 +714,26 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		return fmt.Errorf("get ingress %s: %w", ingressName, err)
 	}
 
-	// Only update if something actually changed
+	// Only update if something we manage actually changed.
+	// The existing Ingress may have extra annotations added by nginx or other controllers,
+	// so we only check that our desired annotations/labels are present with correct values.
 	if reflect.DeepEqual(existing.Spec, desired.Spec) &&
-		reflect.DeepEqual(existing.Labels, desired.Labels) &&
-		reflect.DeepEqual(existing.Annotations, desired.Annotations) {
+		mapsContainAll(existing.Labels, desired.Labels) &&
+		mapsContainAll(existing.Annotations, desired.Annotations) {
 		return nil
 	}
 
 	existing.Spec = desired.Spec
-	existing.Labels = desired.Labels
-	existing.Annotations = desired.Annotations
+	// Merge our labels/annotations into existing (preserving any extras added by other controllers)
+	for k, v := range desired.Labels {
+		existing.Labels[k] = v
+	}
+	for k, v := range desired.Annotations {
+		if existing.Annotations == nil {
+			existing.Annotations = make(map[string]string)
+		}
+		existing.Annotations[k] = v
+	}
 	log.V(1).Info("Updating Ingress for pool", "ingress", ingressName, "namespace", ingressNamespace, "host", pool.Spec.Host)
 	return r.Update(ctx, existing)
 }
@@ -755,4 +765,14 @@ func (r *SparkSessionPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func boolPtr(b bool) *bool {
 	return &b
+}
+
+// mapsContainAll returns true if all key-value pairs in wanted exist in actual.
+func mapsContainAll(actual, wanted map[string]string) bool {
+	for k, v := range wanted {
+		if actual[k] != v {
+			return false
+		}
+	}
+	return true
 }
