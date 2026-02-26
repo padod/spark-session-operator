@@ -180,10 +180,23 @@ kubectl get ingress -n spark-session-operator
 ### 6. Подключение через прокси
 
 **DBeaver (Thrift через HTTP transport):**
-1. Создайте новое подключение Apache Hive
-2. JDBC URL: `jdbc:hive2://spark-thrift-default.example.com:80/default;transportMode=http;httpPath=cliservice`
-3. Аутентификация: введите доменные логин и пароль
-4. Сессия создаётся автоматически при подключении
+
+1. **Database** → **New Database Connection** → найдите **Apache Hive** → **Next**
+2. На вкладке **Main**:
+   - **Host**: `spark-thrift-default.example.com`
+   - **Port**: `80`
+   - **Database/Schema**: `default`
+   - **Username**: ваш доменный логин (например, `alice`)
+   - **Password**: ваш доменный пароль
+3. Нажмите **Edit Driver Settings** (или перейдите на вкладку **Driver properties**) и установите:
+   - `transportMode` = `http`
+   - `httpPath` = `cliservice`
+4. Нажмите **Test Connection** — сессия создаётся автоматически при первом запросе
+
+Или переключитесь на вкладку **URL**, поставьте галочку **Use URL** и вставьте:
+```
+jdbc:hive2://spark-thrift-default.example.com:80/default;transportMode=http;httpPath=cliservice
+```
 
 **PyHive (Thrift через HTTP transport):**
 ```python

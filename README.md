@@ -180,10 +180,23 @@ In this mode the proxy accepts any username/password without contacting an OIDC 
 ### 6. Connect via proxy
 
 **DBeaver (Thrift via HTTP transport):**
-1. Create a new Apache Hive connection
-2. JDBC URL: `jdbc:hive2://spark-thrift-default.example.com:80/default;transportMode=http;httpPath=cliservice`
-3. Authentication: enter your domain username and password
-4. A session is auto-created when you connect
+
+1. **Database** → **New Database Connection** → search for **Apache Hive** → **Next**
+2. On the **Main** tab:
+   - **Host**: `spark-thrift-default.example.com`
+   - **Port**: `80`
+   - **Database/Schema**: `default`
+   - **Username**: your domain username (e.g. `alice`)
+   - **Password**: your domain password
+3. Click **Edit Driver Settings** (or go to **Driver properties** tab) and set:
+   - `transportMode` = `http`
+   - `httpPath` = `cliservice`
+4. Click **Test Connection** — a session is auto-created on the first query
+
+Alternatively, switch to the **URL** tab, tick **Use URL** and paste:
+```
+jdbc:hive2://spark-thrift-default.example.com:80/default;transportMode=http;httpPath=cliservice
+```
 
 **PyHive (Thrift via HTTP transport):**
 ```python
