@@ -36,6 +36,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
@@ -417,6 +418,14 @@ func (p *SessionProxy) StartConnectProxy(addr string) error {
 	server := grpc.NewServer(
 		grpc.ForceServerCodec(rawCodec{}),
 		grpc.UnknownServiceHandler(p.handleConnectStream),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			Time:    20 * time.Second, // ping client every 20s if idle
+			Timeout: 10 * time.Second, // wait 10s for ping ack
+		}),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second, // allow client pings as often as every 10s
+			PermitWithoutStream: true,
+		}),
 	)
 
 	p.log.Info("Starting Connect gRPC proxy", "addr", addr)
@@ -529,6 +538,11 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	backendConn, err := grpc.NewClient("passthrough:///"+endpoint,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                20 * time.Second, // ping backend every 20s if idle
+			Timeout:             10 * time.Second,  // wait 10s for ping ack
+			PermitWithoutStream: true,
+		}),
 	)
 	if err != nil {
 		p.log.Error(err, "Failed to connect to backend", "endpoint", endpoint, "session", sessionName)

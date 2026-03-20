@@ -658,7 +658,6 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		backendPort = 15002
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = "3600"
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = "3600"
-		extraAnnotations["nginx.ingress.kubernetes.io/server-snippet"] = "grpc_socket_keepalive on;\ngrpc_read_timeout 3600s;\ngrpc_send_timeout 3600s;"
 	case "thrift":
 		ingressSuffix = "-thrift"
 		backendProtocol = "HTTP"
