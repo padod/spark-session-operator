@@ -658,6 +658,13 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		backendPort = 15002
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-read-timeout"] = "3600"
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-send-timeout"] = "3600"
+		// Spark Connect error responses carry the full analyzed plan in the
+		// grpc-message header / grpc-status-details-bin trailer. The default
+		// nginx proxy_buffer_size (4–8k) is too small for those, and nginx
+		// synthesizes a 502 instead of forwarding the gRPC error, which the
+		// client sees as UNAVAILABLE instead of AnalysisException.
+		extraAnnotations["nginx.ingress.kubernetes.io/proxy-buffer-size"] = "32k"
+		extraAnnotations["nginx.ingress.kubernetes.io/proxy-buffers-number"] = "8"
 	case "thrift":
 		ingressSuffix = "-thrift"
 		backendProtocol = "HTTP"

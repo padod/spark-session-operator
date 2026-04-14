@@ -48,7 +48,35 @@ const (
 	sessionPollInterval = 500 * time.Millisecond
 	sessionPollTimeout  = 60 * time.Second
 	keepaliveInterval   = 2 * time.Minute
+
+	// maxGRPCMessageBytes caps the size of the grpc-message string we forward
+	// to the client. Spark Connect embeds the full analyzed plan into its
+	// AnalysisException messages, which can run to many KB and blow past the
+	// nginx ingress proxy_buffer_size — nginx then returns HTTP 502 instead
+	// of forwarding the gRPC error, and PySpark surfaces UNAVAILABLE rather
+	// than AnalysisException. The rich error info (ErrorInfo, stack traces,
+	// error class) lives in status details and is preserved untouched.
+	maxGRPCMessageBytes = 1024
 )
+
+// truncateStatusError rebuilds a gRPC status error with its Message capped at
+// maxGRPCMessageBytes, preserving Code and Details. Non-status errors and
+// errors with short messages pass through unchanged.
+func truncateStatusError(err error) error {
+	if err == nil {
+		return nil
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		return err
+	}
+	p := st.Proto()
+	if p == nil || len(p.Message) <= maxGRPCMessageBytes {
+		return err
+	}
+	p.Message = p.Message[:maxGRPCMessageBytes] + "... [truncated by proxy]"
+	return status.FromProto(p).Err()
+}
 
 // SessionProxy handles incoming Thrift and gRPC connections, auto-creating sessions
 // and proxying traffic to the assigned backend.
@@ -630,7 +658,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	for i := 0; i < 2; i++ {
 		if err := <-errCh; err != nil {
 			p.log.V(1).Info("gRPC stream ended", "session", sessionName, "error", err)
-			return err
+			return truncateStatusError(err)
 		}
 	}
 
