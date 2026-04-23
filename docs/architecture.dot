@@ -1,0 +1,197 @@
+// Spark Session Operator — Architecture
+// Render: dot -Tpng docs/architecture.dot -o docs/architecture.png -Gdpi=150
+//         dot -Tsvg docs/architecture.dot -o docs/architecture.svg
+
+digraph SparkSessionOperator {
+    rankdir=TB;
+    fontname="Helvetica";
+    fontsize=12;
+    node [fontname="Helvetica", fontsize=10, style=filled, shape=box, fillcolor="#f5f5f5"];
+    edge [fontname="Helvetica", fontsize=8];
+    compound=true;
+    newrank=true;
+    nodesep=0.5;
+    ranksep=0.8;
+
+    // ─── Clients ───────────────────────────────────────────────────
+    subgraph cluster_clients {
+        label="Clients";
+        labeljust=l;
+        style=dashed;
+        color="#94a3b8";
+        fontcolor="#64748b";
+        fontsize=11;
+        margin=16;
+
+        jupyter   [label="Jupyter / PySpark\n(Spark Connect)", shape=component, fillcolor="#dbeafe"];
+        dbeaver   [label="DBeaver / PyHive\n(Thrift HTTP)", shape=component, fillcolor="#dbeafe"];
+        restcli   [label="REST Client\n(curl / UI)", shape=component, fillcolor="#dbeafe"];
+        kubectl   [label="kubectl / CI", shape=component, fillcolor="#dbeafe"];
+    }
+
+    // ─── Nginx Ingress ─────────────────────────────────────────────
+    subgraph cluster_ingress {
+        label="  Nginx Ingress Controller  ";
+        labeljust=l;
+        style=filled;
+        fillcolor="#fff7ed";
+        color="#fb923c";
+        fontsize=11;
+        margin=16;
+
+        node [shape=cds, fillcolor="#fef3c7"];
+
+        ing_connect [label="*-connect Ingress\nspark-connect-*.host\nbackend: GRPC :15002"];
+        ing_thrift  [label="*-thrift Ingress\nspark-thrift-*.host\nbackend: HTTP :10009"];
+        ing_gw      [label="gateway Ingress\nspark-api.host\nbackend: HTTP :8080"];
+    }
+
+    // ─── Operator Namespace ────────────────────────────────────────
+    subgraph cluster_operator {
+        label="  spark-session-operator namespace  ";
+        labeljust=l;
+        style=filled;
+        fillcolor="#f0fdf4";
+        color="#4ade80";
+        fontsize=11;
+        margin=20;
+
+        subgraph cluster_binary {
+            label="  Operator Pod  ";
+            labeljust=l;
+            style=filled;
+            fillcolor="#dcfce7";
+            color="#86efac";
+            fontsize=11;
+            margin=16;
+
+            // Proxies row
+            connect_p [label="Connect gRPC Proxy\n:15002\nmetadata/proto auth", shape=box3d, fillcolor="#bbf7d0"];
+            thrift_p  [label="Thrift HTTP Proxy\n:10009\nBasic auth", shape=box3d, fillcolor="#bbf7d0"];
+            gateway   [label="REST API Gateway\n:8080\nOIDC Bearer", shape=box3d, fillcolor="#bbf7d0"];
+
+            // Controllers row
+            pool_ctrl [label="Pool Controller\nscaling / ingress / lifecycle", shape=hexagon, fillcolor="#a7f3d0"];
+            sess_ctrl [label="Session Controller\nassignment / idle timeout", shape=hexagon, fillcolor="#a7f3d0"];
+        }
+    }
+
+    // ─── Keycloak ──────────────────────────────────────────────────
+    keycloak [label="Keycloak\nOIDC + ROPC", shape=cylinder, fillcolor="#fbcfe8"];
+
+    // ─── Kubernetes APIs ───────────────────────────────────────────
+    subgraph cluster_k8s {
+        label="  Kubernetes API Server  ";
+        labeljust=l;
+        style=filled;
+        fillcolor="#eff6ff";
+        color="#60a5fa";
+        fontsize=11;
+        margin=16;
+
+        node [shape=note, fillcolor="#bfdbfe"];
+
+        crd_pool    [label="SparkSessionPool\nCRD"];
+        crd_sess    [label="SparkInteractiveSession\nCRD"];
+        sparkapp    [label="SparkApplication\nCRD"];
+        ingress_api [label="Ingress API"];
+        metrics_api [label="Metrics API\n(cpu/mem)"];
+    }
+
+    // ─── Spark Workloads ───────────────────────────────────────────
+    subgraph cluster_spark {
+        label="  spark-dev namespace  ";
+        labeljust=l;
+        style=filled;
+        fillcolor="#faf5ff";
+        color="#c084fc";
+        fontsize=11;
+        margin=20;
+
+        subgraph cluster_cp {
+            label="connect-default-pool";
+            style=filled; fillcolor="#f3e8ff"; color="#d8b4fe";
+            margin=10;
+            sc1 [label="SparkApp\n(Connect :8424)", shape=box3d, fillcolor="#e9d5ff"];
+            sc2 [label="SparkApp", shape=box3d, fillcolor="#e9d5ff"];
+        }
+
+        subgraph cluster_tp {
+            label="thrift-default-pool";
+            style=filled; fillcolor="#f3e8ff"; color="#d8b4fe";
+            margin=10;
+            st1 [label="SparkApp\n(Thrift HTTP :10001)", shape=box3d, fillcolor="#e9d5ff"];
+            st2 [label="SparkApp", shape=box3d, fillcolor="#e9d5ff"];
+        }
+
+        subgraph cluster_pool_n {
+            label="your-pool-N";
+            style="filled,dashed"; fillcolor="#f9fafb"; color="#cbd5e1";
+            fontcolor="#94a3b8";
+            margin=10;
+            pool_n_placeholder [label="SparkApp\n...", shape=box3d, fillcolor="#f1f5f9", color="#cbd5e1", fontcolor="#94a3b8"];
+        }
+
+        subgraph cluster_pool_m {
+            label="your-pool-M";
+            style="filled,dashed"; fillcolor="#f9fafb"; color="#cbd5e1";
+            fontcolor="#94a3b8";
+            margin=10;
+            pool_m_placeholder [label="SparkApp\n...", shape=box3d, fillcolor="#f1f5f9", color="#cbd5e1", fontcolor="#94a3b8"];
+        }
+    }
+
+    // ─── External ──────────────────────────────────────────────────
+    subgraph cluster_ext {
+        label="External Services";
+        labeljust=l;
+        style=dashed; color="#94a3b8"; fontcolor="#64748b";
+        fontsize=11;
+        margin=16;
+        hive [label="Hive Metastore", shape=cylinder, fillcolor="#fef9c3"];
+        s3   [label="S3 Storage", shape=cylinder, fillcolor="#fef9c3"];
+    }
+
+    // ═══ EDGES ═══════════════════════════════════════════════════════
+
+    // Clients -> Ingress
+    jupyter -> ing_connect [label="sc://spark-connect-*", color="#3b82f6"];
+    dbeaver -> ing_thrift  [label="JDBC http transport", color="#f59e0b"];
+    restcli -> ing_gw      [label="HTTP", color="#6b7280"];
+    kubectl -> crd_sess    [label="kubectl apply", color="#6b7280", style=dashed];
+
+    // Ingress -> Proxies
+    ing_connect -> connect_p [color="#3b82f6"];
+    ing_thrift  -> thrift_p  [color="#f59e0b"];
+    ing_gw      -> gateway   [color="#6b7280"];
+
+    // Auth -> Keycloak
+    connect_p -> keycloak [label="ROPC", color="#ec4899", style=dashed, constraint=false];
+    thrift_p  -> keycloak [label="ROPC", color="#ec4899", style=dashed, constraint=false];
+    gateway   -> keycloak [label="verify", color="#ec4899", style=dashed, constraint=false];
+
+    // Proxies -> Sessions CRD
+    connect_p -> crd_sess [label="find/create session", color="#22c55e"];
+    thrift_p  -> crd_sess [label="find/create session", color="#22c55e"];
+
+    // Proxies -> Backend
+    connect_p -> sc1 [label="gRPC proxy", color="#3b82f6", lhead=cluster_cp];
+    thrift_p  -> st1 [label="HTTP reverse proxy\n/cliservice", color="#f59e0b", lhead=cluster_tp];
+
+    // Pool Controller -> K8s
+    pool_ctrl -> crd_pool    [label="watch", color="#22c55e", dir=both];
+    pool_ctrl -> sparkapp    [label="create/delete", color="#a855f7"];
+    pool_ctrl -> ingress_api [label="reconcile", color="#f59e0b"];
+    pool_ctrl -> metrics_api [label="pod metrics", color="#6b7280", style=dashed];
+    pool_ctrl -> crd_sess    [label="count sessions", color="#22c55e", style=dashed];
+
+    // Session Controller -> K8s
+    sess_ctrl -> crd_sess [label="watch", color="#22c55e", dir=both];
+    sess_ctrl -> sparkapp [label="find instance", color="#a855f7", style=dashed];
+
+    // Spark -> External
+    sc1 -> hive [color="#a855f7", style=dashed, constraint=false];
+    sc1 -> s3   [color="#a855f7", style=dashed, constraint=false];
+    st1 -> hive [color="#a855f7", style=dashed, constraint=false];
+    st1 -> s3   [color="#a855f7", style=dashed, constraint=false];
+}

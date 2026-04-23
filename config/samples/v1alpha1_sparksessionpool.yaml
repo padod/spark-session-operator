@@ -1,0 +1,9 @@
+apiVersion: sparkinteractive.io/v1alpha1
+kind: SparkSessionPool
+metadata:
+  labels:
+    app.kubernetes.io/name: spark-session-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: sparksessionpool-sample
+spec:
+  # TODO(user): Add fields here

@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "spark-session-operator.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spark-session-operator.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "spark-session-operator.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spark-session-operator.selectorLabels" . | nindent 8 }}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: manager
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        command:
+        - /manager
+        args:
+        - --leader-elect={{ .Values.leaderElect }}
+        - --health-probe-bind-address=:8081
+        - --metrics-bind-address=:8443
+        - --namespace={{ .Values.namespace }}
+        {{- with .Values.proxyNamespace }}
+        - --proxy-namespace={{ . }}
+        {{- end }}
+        {{- if .Values.oidc.skipValidation }}
+        - --oidc-skip-validation
+        {{- end }}
+        {{- with .Values.oidc.issuerUrl }}
+        - --oidc-issuer-url={{ . }}
+        {{- end }}
+        {{- with .Values.oidc.clientId }}
+        - --oidc-client-id={{ . }}
+        {{- end }}
+        {{- with .Values.oidc.clientSecret }}
+        - --oidc-client-secret={{ . }}
+        {{- end }}
+        {{- with .Values.oidc.audience }}
+        - --oidc-audience={{ . }}
+        {{- end }}
+        {{- with .Values.oidc.userClaim }}
+        - --oidc-user-claim={{ . }}
+        {{- end }}
+        {{- with .Values.oidc.groupsClaim }}
+        - --oidc-groups-claim={{ . }}
+        {{- end }}
+        ports:
+        - containerPort: 8080
+          name: gateway
+          protocol: TCP
+        - containerPort: 10009
+          name: thrift-proxy
+          protocol: TCP
+        - containerPort: 15002
+          name: connect-proxy
+          protocol: TCP
+        securityContext:
+          readOnlyRootFilesystem: true
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - "ALL"
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+      serviceAccountName: {{ include "spark-session-operator.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
