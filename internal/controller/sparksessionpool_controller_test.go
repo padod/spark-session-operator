@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -51,7 +52,23 @@ var _ = Describe("SparkSessionPool Controller", func() {
 						Name:      resourceName,
 						Namespace: "default",
 					},
-					// TODO(user): Specify other spec details if needed.
+					Spec: sparkinteractiveiov1alpha1.SparkSessionPoolSpec{
+						Type: "connect",
+						Host: "test-pool.example.com",
+						Replicas: sparkinteractiveiov1alpha1.ReplicaSpec{
+							Min: 0,
+							Max: 1,
+						},
+						Scaling: sparkinteractiveiov1alpha1.ScalingSpec{
+							Metrics: sparkinteractiveiov1alpha1.ScalingMetricsSpec{
+								Type:              "activeSessions",
+								TargetPerInstance: 20,
+							},
+						},
+						SparkApplicationTemplate: sparkinteractiveiov1alpha1.SparkApplicationTemplateSpec{
+							Spec: &apiextensionsv1.JSON{Raw: []byte(`{}`)},
+						},
+					},
 				}
 				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
 			}
@@ -68,9 +85,12 @@ var _ = Describe("SparkSessionPool Controller", func() {
 		})
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
+			// Use the cached manager client: the reconciler issues
+			// List(... MatchingFields{"spec.pool": ...}), which only works
+			// against the cached client that has the field index registered.
 			controllerReconciler := &SparkSessionPoolReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client: mgrClient,
+				Scheme: mgrClient.Scheme(),
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{

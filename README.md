@@ -35,6 +35,12 @@ This allows multiple pools of the same type (e.g. `connect-default-pool` and `co
 
 Pools support `replicas.min: 0`. When a user connects and no instances exist, the proxy creates a session CR in `Pending` state. The pool controller counts pending unassigned sessions alongside active ones, triggering SparkApplication creation even when the pool has zero running instances.
 
+### Operational behavior
+
+- **Graceful shutdown.** On SIGTERM the operator binary stops accepting new connections, drains in-flight Thrift HTTP requests and Spark Connect gRPC streams (bounded by an internal 30 s budget), and then exits. Set `terminationGracePeriodSeconds` on the operator Deployment ≥ the drain budget so kubelet doesn't kill the pod mid-drain.
+- **Degraded condition.** The pool status carries a `Degraded` condition that the controller updates every reconcile. `False` (reason `Healthy`) means the last pass succeeded; `True` (reason `ReconcileError`) aggregates every failing phase (ingress, scaling, failed-instance replacement, status update) into a single message — visible via `kubectl describe sparksessionpool <name>`.
+- **Stale-endpoint recovery.** The proxy caches resolved backend endpoints. If a driver pod restarts with a new IP, the Spark Connect path invalidates the cached entry and retries once with a freshly resolved address; the Thrift HTTP path invalidates on transport error so the next request gets the fresh address (the in-flight request returns 502 because its body has already been streamed).
+
 ### Session creation paths
 
 | Path | Protocol | Use case |
@@ -177,6 +183,8 @@ For development or testing without a Keycloak instance, you can skip token valid
 
 In this mode the proxy accepts any username/password without contacting an OIDC provider. The username is taken as-is for session ownership. **Do not use this in production.**
 
+The `--oidc-issuer-url` flag requires an `https://` scheme to avoid leaking passwords over the wire on the ROPC POST. The one exception is loopback hosts (`127.0.0.0/8`, `::1`, or literal `localhost`), which are allowed over plain `http://` so the integration test suite (which spins up `httptest` IDPs on `127.0.0.1`) can exercise the full signed-JWKS validation path without needing TLS certificates. Any non-loopback host must use `https://`, or you must opt in to `--oidc-skip-validation` for dev.
+
 ### 6. Connect via proxy
 
 **DBeaver (Thrift via HTTP transport):**
@@ -267,11 +275,11 @@ The operator accepts the following command-line flags:
 | `--gateway-addr` | `:8080` | Address for the REST API gateway |
 | `--thrift-proxy-addr` | `:10009` | Address for the Thrift HTTP proxy |
 | `--connect-proxy-addr` | `:15002` | Address for the Spark Connect gRPC proxy |
-| `--oidc-issuer-url` | _(empty)_ | OIDC issuer URL (e.g. `https://keycloak.example.com/realms/spark`) |
+| `--oidc-issuer-url` | _(empty)_ | OIDC issuer URL (e.g. `https://keycloak.example.com/realms/spark`). Required unless `--oidc-skip-validation=true` is passed — the operator refuses to start with both unset, so a misconfigured deployment can't silently fall back to trusting any JWT. |
 | `--oidc-audience` | _(empty)_ | Expected OIDC audience |
-| `--oidc-user-claim` | `sub` | JWT claim containing the username |
+| `--oidc-user-claim` | `sub` | JWT claim containing the username. The resolved username must be printable and must not contain `:`, CR, or LF — those characters would corrupt the proxied Basic-auth framing and HTTP headers, so tokens carrying such usernames are rejected. |
 | `--oidc-groups-claim` | `groups` | JWT claim containing user groups |
-| `--oidc-skip-validation` | `false` | Skip OIDC token validation (dev only) |
+| `--oidc-skip-validation` | `false` | Skip OIDC token validation (dev only). Must be passed explicitly to start the operator without `--oidc-issuer-url`. |
 | `--oidc-client-id` | _(empty)_ | OAuth client ID for Keycloak ROPC grant (used by proxy) |
 | `--oidc-client-secret` | _(empty)_ | OAuth client secret for Keycloak ROPC grant (optional) |
 | `--leader-elect` | `false` | Enable leader election for HA |
@@ -304,6 +312,8 @@ curl -H "Authorization: Bearer $TOKEN" \
 ```
 
 With `--oidc-skip-validation` enabled, any valid-looking JWT is accepted without signature verification.
+
+The authenticated `/api/v1/sessions*` endpoints are rate-limited per source IP (token bucket: 60-request burst, refilled at 1 request/second). Requests over the budget receive `429 Too Many Requests`. The limit applies to the immediate TCP peer — `X-Forwarded-For` is intentionally not honored, since a header-spoofable key defeats the purpose. Behind an ingress that terminates TLS, the budget effectively applies to the ingress IP; provision accordingly if you front the gateway with a single load balancer. The unauthenticated endpoints (`/api/v1/pools`, `/healthz`, `/readyz`) are not rate-limited.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -480,7 +490,9 @@ make test
 │   ├── controller/                # Reconciliation logic
 │   │   ├── sparksessionpool_controller.go      # Pool scaling, Ingress, lifecycle
 │   │   └── sparkinteractivesession_controller.go  # Session assignment, timeout
-│   ├── gateway/server.go          # REST API gateway (read + delete)
+│   ├── gateway/                   # REST API gateway (read + delete)
+│   │   ├── server.go
+│   │   └── templates/pools.html   # Embedded dashboard template (html/template)
 │   └── proxy/                     # Auto-session proxies
 │       ├── proxy.go               # Session lifecycle, Thrift HTTP proxy, Connect gRPC proxy
 │       └── connect_grpc.go        # gRPC credential extraction + raw codec

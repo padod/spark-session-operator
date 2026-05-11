@@ -1,13 +1,26 @@
 name: E2E Tests
 
+# E2E runs a real Kind cluster + builds the docker image + installs
+# CertManager + spawns the operator. It's the most expensive job we have, so
+# we don't fire it on every push to feature branches — only:
+#   - pushes to main (catch regressions on integration)
+#   - PRs (catch regressions before merge)
+#   - manual dispatch (debugging)
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test-e2e:
-    name: Run on Ubuntu
+    name: Kind + operator
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -16,17 +29,25 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
-      - name: Install the latest version of kind
+      - name: Verify Go modules
         run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
+          go mod download
+          go mod verify
+
+      # Use the official action so we get a pinned, audited install of kind
+      # instead of curling a `latest` binary every time.
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+          # Pin to a specific kind release so the e2e environment is
+          # reproducible. Bump deliberately, not implicitly via `latest`.
+          version: v0.27.0
 
       - name: Verify kind installation
         run: kind version
 
-      - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e
+      - name: Run e2e suite
+        run: make test-e2e

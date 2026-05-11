@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html><head>
+<title>Spark Session Pools</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px; background: #f8f9fa; }
+  h1 { color: #1a1a1a; font-size: 1.4em; }
+  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #e9ecef; font-size: 0.9em; }
+  th { background: #495057; color: #fff; font-weight: 600; }
+  tr:hover { background: #f1f3f5; }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }
+  .tag-connect { background: #dbeafe; color: #1e40af; }
+  .tag-thrift { background: #fef3c7; color: #92400e; }
+  .ready { color: #16a34a; font-weight: 600; }
+  .not-ready { color: #dc2626; font-weight: 600; }
+  .zero { color: #9ca3af; }
+  .host { font-family: monospace; font-size: 0.85em; }
+  .ts { color: #6b7280; font-size: 0.8em; margin-top: 12px; }
+</style>
+</head><body>
+<h1>Spark Session Pools</h1>
+<table>
+<tr>
+  <th>Pool</th>
+  <th>Type</th>
+  <th>Host</th>
+  <th>Replicas</th>
+  <th>Ready</th>
+  <th>Sessions</th>
+  <th>Max/User</th>
+  <th>Max Total</th>
+  <th>Idle Timeout</th>
+</tr>
+{{range .}}<tr>
+  <td><strong>{{.Name}}</strong></td>
+  <td><span class="tag {{typeClass .Type}}">{{.Type}}</span></td>
+  <td class="host">{{.Host}}</td>
+  <td>{{.CurrentReplicas}} / {{.MinReplicas}}..{{.MaxReplicas}}</td>
+  <td class="{{readyClass .ReadyReplicas .CurrentReplicas}}">{{.ReadyReplicas}}</td>
+  <td class="{{sessClass .TotalActiveSessions}}">{{.TotalActiveSessions}}</td>
+  <td>{{.SessionPolicy.MaxSessionsPerUser}}</td>
+  <td>{{.SessionPolicy.MaxTotalSessions}}</td>
+  <td>{{.SessionPolicy.IdleTimeoutMinutes}}min</td>
+</tr>{{end}}
+</table>
+<p class="ts">Auto-refreshes every 30s. <a href="/api/v1/pools?format=json" style="color:#3b82f6;">JSON</a></p>
+</body></html>

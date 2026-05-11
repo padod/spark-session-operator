@@ -18,8 +18,10 @@ package gateway
 
 import (
 	"context"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"net/http"
 	"strings"
 	"time"
@@ -33,12 +35,30 @@ import (
 	"github.com/padod/spark-session-operator/internal/auth"
 )
 
+//go:embed templates/pools.html
+var poolsTmplFS embed.FS
+
+// maxAPIBodyBytes caps inbound request bodies on /api/v1/* endpoints. The
+// gateway only ever consumes small JSON payloads, so 1 MiB is generous and
+// keeps memory bounded against trivial DoS via oversized POST bodies.
+const maxAPIBodyBytes = 1 << 20
+
+// gatewayShutdownTimeout bounds the graceful drain of in-flight HTTP
+// requests on SIGTERM. Sized to fit comfortably under a typical
+// terminationGracePeriodSeconds of 30s.
+const gatewayShutdownTimeout = 20 * time.Second
+
 // SessionGateway provides REST API for session management
 type SessionGateway struct {
 	client    client.Client
 	log       logr.Logger
 	namespace string
 	auth      *auth.Authenticator
+	limiter   *ipRateLimiter
+
+	// srv is set on Start so callers can invoke Shutdown for a graceful
+	// drain on SIGTERM. nil until Start is called.
+	srv *http.Server
 }
 
 // NewSessionGateway creates a new gateway
@@ -48,6 +68,7 @@ func NewSessionGateway(c client.Client, log logr.Logger, namespace string, authe
 		log:       log.WithName("gateway"),
 		namespace: namespace,
 		auth:      authenticator,
+		limiter:   newIPRateLimiter(defaultRateLimit, defaultRateBurst, defaultIdleTTL),
 	}
 }
 
@@ -69,18 +90,28 @@ type ErrorResponse struct {
 	Message string `json:"message"`
 }
 
-// Start starts the HTTP server
+// Start starts the HTTP server. Returns http.ErrServerClosed when Shutdown is
+// called (graceful path). Any other non-nil error is a hard failure.
 func (g *SessionGateway) Start(addr string) error {
 	router := mux.NewRouter()
 
 	api := router.PathPrefix("/api/v1").Subrouter()
+	// Order matters: cap body size first, then rate-limit, then authenticate.
+	// MaxBytesReader is cheap; rate-limiting before auth ensures unauthenticated
+	// brute-force traffic still pays the per-IP budget.
+	api.Use(g.bodyLimitMiddleware(maxAPIBodyBytes))
+	api.Use(g.rateLimitMiddleware)
 	api.Use(g.authMiddleware)
 
 	api.HandleFunc("/sessions", g.listSessions).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.getSession).Methods("GET")
 	api.HandleFunc("/sessions/{name}", g.deleteSession).Methods("DELETE")
 
-	// Public endpoints (no auth)
+	// Public endpoints (no auth, no rate limit, no body cap). /api/v1/pools
+	// is intentionally unauthenticated so the HTML dashboard is openable in a
+	// browser without a token; the stored-XSS vector that previously existed
+	// on user-controlled pool fields is closed in writePoolsHTML via
+	// html/template auto-escaping.
 	router.HandleFunc("/api/v1/pools", g.listPools).Methods("GET")
 	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -92,8 +123,72 @@ func (g *SessionGateway) Start(addr string) error {
 		w.Write([]byte("ok"))
 	}).Methods("GET")
 
+	g.srv = &http.Server{
+		Addr:              addr,
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	g.log.Info("Starting session gateway", "addr", addr)
-	return http.ListenAndServe(addr, router)
+	return g.srv.ListenAndServe()
+}
+
+// Shutdown gracefully drains in-flight requests. Safe to call before Start
+// (no-op). Returns whatever http.Server.Shutdown returns.
+func (g *SessionGateway) Shutdown(ctx context.Context) error {
+	if g.srv == nil {
+		return nil
+	}
+	return g.srv.Shutdown(ctx)
+}
+
+// Run starts the gateway and blocks until ctx is canceled, then performs a
+// graceful shutdown bounded by gatewayShutdownTimeout. Designed for
+// controller-runtime's manager.Add so SIGTERM drains the API instead of
+// dropping in-flight requests.
+func (g *SessionGateway) Run(ctx context.Context, addr string) error {
+	serveErr := make(chan error, 1)
+	go func() {
+		if err := g.Start(addr); err != nil && err != http.ErrServerClosed {
+			serveErr <- err
+			return
+		}
+		serveErr <- nil
+	}()
+
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), gatewayShutdownTimeout)
+		defer cancel()
+		g.log.Info("Shutting down session gateway")
+		return g.Shutdown(shutdownCtx)
+	case err := <-serveErr:
+		return err
+	}
+}
+
+// bodyLimitMiddleware wraps the request body with http.MaxBytesReader so
+// oversized POST/PUT/DELETE payloads are rejected before handlers allocate.
+func (g *SessionGateway) bodyLimitMiddleware(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// rateLimitMiddleware enforces a per-source-IP token bucket on the protected
+// API surface. The limiter keys on the immediate TCP peer; X-Forwarded-For is
+// not consulted (see clientIP).
+func (g *SessionGateway) rateLimitMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		if !g.limiter.allow(ip) {
+			g.writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many requests")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // authMiddleware extracts and validates the OIDC token
@@ -101,7 +196,10 @@ func (g *SessionGateway) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userInfo, err := g.extractUser(r)
 		if err != nil {
-			g.writeError(w, http.StatusUnauthorized, "unauthorized", err.Error())
+			// Auth errors may carry JWKS/issuer/parsing detail useful to an
+			// attacker probing the IDP. Log server-side, return generic 401.
+			g.log.V(1).Info("Authentication failed", "remote", r.RemoteAddr, "err", err.Error())
+			g.writeError(w, http.StatusUnauthorized, "unauthorized", "Unauthorized")
 			return
 		}
 
@@ -154,7 +252,7 @@ type SessionPolicyInfo struct {
 func (g *SessionGateway) listPools(w http.ResponseWriter, r *http.Request) {
 	poolList := &sparkv1alpha1.SparkSessionPoolList{}
 	if err := g.client.List(r.Context(), poolList, client.InNamespace(g.namespace)); err != nil {
-		g.writeError(w, http.StatusInternalServerError, "list_failed", err.Error())
+		g.serverError(w, "list_failed", "Failed to list pools", err)
 		return
 	}
 
@@ -188,84 +286,42 @@ func (g *SessionGateway) listPools(w http.ResponseWriter, r *http.Request) {
 	g.writeJSON(w, http.StatusOK, responses)
 }
 
+// poolsTmpl renders the pools dashboard from templates/pools.html.
+// html/template auto-escapes every interpolated value, which closes the
+// stored-XSS hole that an fmt.Fprintf-based builder would leave open on
+// user-controlled spec fields (Pool.Host has no character restrictions in
+// the CRD).
+var poolsTmpl = template.Must(template.New("pools.html").Funcs(template.FuncMap{
+	"typeClass": func(t string) string {
+		if t == "thrift" {
+			return "tag-thrift"
+		}
+		return "tag-connect"
+	},
+	"readyClass": func(ready, current int32) string {
+		switch {
+		case ready == 0:
+			return "zero"
+		case ready < current:
+			return "not-ready"
+		default:
+			return "ready"
+		}
+	},
+	"sessClass": func(n int32) string {
+		if n == 0 {
+			return "zero"
+		}
+		return ""
+	},
+}).ParseFS(poolsTmplFS, "templates/pools.html"))
+
 func (g *SessionGateway) writePoolsHTML(w http.ResponseWriter, pools []PoolResponse) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	fmt.Fprint(w, `<!DOCTYPE html>
-<html><head>
-<title>Spark Session Pools</title>
-<meta http-equiv="refresh" content="30">
-<style>
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 24px; background: #f8f9fa; }
-  h1 { color: #1a1a1a; font-size: 1.4em; }
-  table { border-collapse: collapse; width: 100%; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
-  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid #e9ecef; font-size: 0.9em; }
-  th { background: #495057; color: #fff; font-weight: 600; }
-  tr:hover { background: #f1f3f5; }
-  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.8em; font-weight: 600; }
-  .tag-connect { background: #dbeafe; color: #1e40af; }
-  .tag-thrift { background: #fef3c7; color: #92400e; }
-  .ready { color: #16a34a; font-weight: 600; }
-  .not-ready { color: #dc2626; font-weight: 600; }
-  .zero { color: #9ca3af; }
-  .host { font-family: monospace; font-size: 0.85em; }
-  .ts { color: #6b7280; font-size: 0.8em; margin-top: 12px; }
-</style>
-</head><body>
-<h1>Spark Session Pools</h1>
-<table>
-<tr>
-  <th>Pool</th>
-  <th>Type</th>
-  <th>Host</th>
-  <th>Replicas</th>
-  <th>Ready</th>
-  <th>Sessions</th>
-  <th>Max/User</th>
-  <th>Max Total</th>
-  <th>Idle Timeout</th>
-</tr>`)
-
-	for _, p := range pools {
-		typeClass := "tag-connect"
-		if p.Type == "thrift" {
-			typeClass = "tag-thrift"
-		}
-		readyClass := "ready"
-		if p.ReadyReplicas == 0 {
-			readyClass = "zero"
-		}
-		if p.ReadyReplicas < p.CurrentReplicas {
-			readyClass = "not-ready"
-		}
-		sessClass := ""
-		if p.TotalActiveSessions == 0 {
-			sessClass = "zero"
-		}
-		fmt.Fprintf(w, `<tr>
-  <td><strong>%s</strong></td>
-  <td><span class="tag %s">%s</span></td>
-  <td class="host">%s</td>
-  <td>%d / %d..%d</td>
-  <td class="%s">%d</td>
-  <td class="%s">%d</td>
-  <td>%d</td>
-  <td>%d</td>
-  <td>%dmin</td>
-</tr>`,
-			p.Name, typeClass, p.Type, p.Host,
-			p.CurrentReplicas, p.MinReplicas, p.MaxReplicas,
-			readyClass, p.ReadyReplicas,
-			sessClass, p.TotalActiveSessions,
-			p.SessionPolicy.MaxSessionsPerUser,
-			p.SessionPolicy.MaxTotalSessions,
-			p.SessionPolicy.IdleTimeoutMinutes,
-		)
+	if err := poolsTmpl.Execute(w, pools); err != nil {
+		// Header may already be flushed; just log so the operator notices.
+		g.log.Error(err, "render pools HTML")
 	}
-
-	fmt.Fprintf(w, `</table>
-<p class="ts">Auto-refreshes every 30s. <a href="/api/v1/pools?format=json" style="color:#3b82f6;">JSON</a></p>
-</body></html>`)
 }
 
 func (g *SessionGateway) listSessions(w http.ResponseWriter, r *http.Request) {
@@ -276,7 +332,7 @@ func (g *SessionGateway) listSessions(w http.ResponseWriter, r *http.Request) {
 		client.InNamespace(g.namespace),
 		client.MatchingLabels{"sparkinteractive.io/user": userInfo.Username},
 	); err != nil {
-		g.writeError(w, http.StatusInternalServerError, "list_failed", err.Error())
+		g.serverError(w, "list_failed", "Failed to list sessions", err)
 		return
 	}
 
@@ -331,7 +387,7 @@ func (g *SessionGateway) deleteSession(w http.ResponseWriter, r *http.Request) {
 	// Set state to Terminating
 	session.Status.State = "Terminating"
 	if err := g.client.Status().Update(r.Context(), session); err != nil {
-		g.writeError(w, http.StatusInternalServerError, "terminate_failed", err.Error())
+		g.serverError(w, "terminate_failed", "Failed to terminate session", err)
 		return
 	}
 
@@ -367,4 +423,13 @@ func (g *SessionGateway) writeJSON(w http.ResponseWriter, status int, v interfac
 
 func (g *SessionGateway) writeError(w http.ResponseWriter, status int, errCode, message string) {
 	g.writeJSON(w, status, ErrorResponse{Error: errCode, Message: message})
+}
+
+// serverError logs the underlying error server-side and returns a generic 500
+// response. Internal error text (resource names, namespaces, RBAC details,
+// apiserver stack frames) is kept out of the client-facing payload to avoid
+// information disclosure.
+func (g *SessionGateway) serverError(w http.ResponseWriter, errCode, message string, err error) {
+	g.log.Error(err, message, "code", errCode)
+	g.writeError(w, http.StatusInternalServerError, errCode, message)
 }

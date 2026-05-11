@@ -20,6 +20,33 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Session condition types. Keep these as string constants so the proxy and
+// gateway can branch on them without importing controller internals.
+const (
+	// ConditionInstanceReady signals whether the SparkApplication backing
+	// this session is in a state that can accept connections. Set to False
+	// with a diagnostic Reason/Message when assignment is blocked (instance
+	// stuck Pending, SparkApplication failed, no capacity) so the proxy can
+	// short-circuit waitForSessionActive instead of timing out opaquely.
+	ConditionInstanceReady = "InstanceReady"
+
+	// ConditionQuotaExceeded is set True when admission rejects a session
+	// because the pool's MaxSessionsPerUser / MaxTotalSessions limit has been
+	// reached. The Message carries the actual limit and current count so the
+	// gateway/proxy can surface ResourceExhausted / 429 to the client.
+	ConditionQuotaExceeded = "QuotaExceeded"
+
+	// ConditionPoolDeleted is set True when the parent pool has been deleted
+	// and the session has been cascade-terminated. Distinct from
+	// InstanceTerminated which targets a single instance going away.
+	ConditionPoolDeleted = "PoolDeleted"
+
+	// ConditionInstanceTerminated is set True when the SparkApplication
+	// hosting this session was removed (scale-down, node loss, manual
+	// delete) and the session can no longer be served.
+	ConditionInstanceTerminated = "InstanceTerminated"
+)
+
 // SparkInteractiveSessionSpec defines the desired state of a user session
 type SparkInteractiveSessionSpec struct {
 	// User identifier (from OIDC token)

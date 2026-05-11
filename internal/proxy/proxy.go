@@ -19,6 +19,7 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -26,10 +27,11 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -48,6 +50,22 @@ const (
 	sessionPollInterval = 500 * time.Millisecond
 	sessionPollTimeout  = 60 * time.Second
 	keepaliveInterval   = 2 * time.Minute
+
+	// keepaliveUpdateTimeout caps the per-tick LastActivityAt update so a
+	// slow apiserver can't pile up unbounded in-flight writes.
+	keepaliveUpdateTimeout = 5 * time.Second
+
+	// proxyShutdownTimeout bounds the graceful drain of the Thrift HTTP
+	// proxy. The gRPC proxy uses GracefulStop, which has no internal timeout —
+	// we wrap it with the same budget so SIGTERM doesn't hang the pod past
+	// terminationGracePeriodSeconds.
+	proxyShutdownTimeout = 30 * time.Second
+
+	// backendFailureProbeTimeout bounds the apiserver Get used to translate
+	// a generic transport error into a specific driver-pod cause (Evicted,
+	// OOMKilled, NodeShutdown). Kept tight so a slow apiserver can't turn a
+	// bad situation worse — we degrade to the generic message on miss.
+	backendFailureProbeTimeout = 1 * time.Second
 
 	// maxGRPCMessageBytes caps the size of the grpc-message string we forward
 	// to the client. Spark Connect embeds the full analyzed plan into its
@@ -86,12 +104,16 @@ type SessionProxy struct {
 	namespace string
 	auth      *auth.Authenticator
 
-	// sessions tracks user+pool → session name to avoid races
-	// when multiple RPCs arrive before the informer cache updates.
-	sessions sync.Map // key: "user:pool", value: string (session name)
+	// sessions maps "user:pool" → session name and absorbs races when
+	// multiple RPCs arrive before the informer cache updates. Entries
+	// expire after sessionCacheTTL so the map stays memory-bounded and
+	// stale references self-heal once the TTL lapses.
+	sessions *ttlMap
 
-	// endpoints caches session → resolved endpoint URL to avoid re-polling on every HTTP request.
-	endpoints sync.Map // key: session name, value: string (endpoint)
+	// endpoints caches session name → resolved backend endpoint. TTL-bounded
+	// for the same reasons; on a backend connection failure callers should
+	// delete the entry to force a fresh resolution on the next request.
+	endpoints *ttlMap
 }
 
 // NewSessionProxy creates a new proxy.
@@ -101,6 +123,8 @@ func NewSessionProxy(c client.Client, log logr.Logger, namespace string, authent
 		log:       log.WithName("proxy"),
 		namespace: namespace,
 		auth:      authenticator,
+		sessions:  newTTLMap(sessionCacheTTL),
+		endpoints: newTTLMap(sessionCacheTTL),
 	}
 }
 
@@ -157,8 +181,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 	key := sessionKey(username, poolName)
 
 	// 1. Check in-memory cache first (handles concurrent RPCs).
-	if cached, ok := p.sessions.Load(key); ok {
-		name := cached.(string)
+	if name, ok := p.sessions.get(key); ok {
 		// Validate the session still exists and is usable.
 		session := &sparkv1alpha1.SparkInteractiveSession{}
 		if err := p.client.Get(ctx, client.ObjectKey{
@@ -172,7 +195,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 			}
 		}
 		// Cached session is gone or failed — remove from cache.
-		p.sessions.Delete(key)
+		p.sessions.delete(key)
 	}
 
 	// 2. Check the informer cache for existing sessions.
@@ -191,7 +214,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 		switch s.Status.State {
 		case "Active", "Idle", "Pending", "Assigning":
 			p.log.Info("Reusing session (discovered)", "name", s.Name, "user", username, "state", s.Status.State)
-			p.sessions.Store(key, s.Name)
+			p.sessions.set(key, s.Name)
 			return s.Name, nil
 		}
 	}
@@ -201,7 +224,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 	if err != nil {
 		return "", err
 	}
-	p.sessions.Store(key, name)
+	p.sessions.set(key, name)
 	return name, nil
 }
 
@@ -235,8 +258,29 @@ func (p *SessionProxy) createSession(ctx context.Context, username, poolName str
 	return sessionName, nil
 }
 
+// quotaExceededError is the typed failure waitForSessionActive returns when
+// a session was rejected by pool quota policy. Callers branch on it to
+// translate to codes.ResourceExhausted / HTTP 429 instead of a generic
+// Unavailable / 503, which the client would otherwise read as "operator
+// outage" rather than "you hit your limit."
+type quotaExceededError struct{ message string }
+
+func (e *quotaExceededError) Error() string { return e.message }
+
+func isQuotaExceeded(err error) bool {
+	var qe *quotaExceededError
+	return errors.As(err, &qe)
+}
+
 // waitForSessionActive polls the session CR until it reaches Active state.
 // Returns the endpoint or an error on timeout/failure.
+//
+// As an early-exit optimization, the controller may stamp an
+// InstanceReady=False condition on the session when the backing
+// SparkApplication is stuck/failed; when present we surface its message
+// immediately instead of waiting out the full 60 s poll budget. This is the
+// path that turns an opaque "session failed to start" into something like
+// "SparkApplication X in state FAILED: ImagePullBackOff" for the client.
 func (p *SessionProxy) waitForSessionActive(ctx context.Context, sessionName string) (string, error) {
 	deadline := time.Now().Add(sessionPollTimeout)
 	ticker := time.NewTicker(sessionPollInterval)
@@ -258,7 +302,17 @@ func (p *SessionProxy) waitForSessionActive(ctx context.Context, sessionName str
 			}
 			return session.Status.Endpoint, nil
 		case "Failed", "Terminated", "Terminating":
+			if msg := conditionMessage(session, sparkv1alpha1.ConditionQuotaExceeded, metav1.ConditionTrue); msg != "" {
+				return "", &quotaExceededError{message: msg}
+			}
+			if reason := terminalReason(session); reason != "" {
+				return "", fmt.Errorf("session %s entered state %s: %s", sessionName, session.Status.State, reason)
+			}
 			return "", fmt.Errorf("session %s entered state %s", sessionName, session.Status.State)
+		}
+
+		if msg := instanceNotReadyMessage(session); msg != "" {
+			return "", fmt.Errorf("session %s cannot become active: %s", sessionName, msg)
 		}
 
 		if time.Now().After(deadline) {
@@ -271,6 +325,56 @@ func (p *SessionProxy) waitForSessionActive(ctx context.Context, sessionName str
 		case <-ticker.C:
 		}
 	}
+}
+
+// conditionMessage returns the Message of the first condition matching the
+// given type+status, or "" when no such condition is present. Used to peek
+// at typed reasons (QuotaExceeded, PoolDeleted) so the proxy can choose the
+// right gRPC code / HTTP status for the client.
+func conditionMessage(session *sparkv1alpha1.SparkInteractiveSession, condType string, want metav1.ConditionStatus) string {
+	for _, c := range session.Status.Conditions {
+		if c.Type == condType && c.Status == want {
+			return c.Message
+		}
+	}
+	return ""
+}
+
+// instanceNotReadyMessage returns the InstanceReady=False message set by the
+// session controller when assignment is blocked, or "" if no such condition
+// is present.
+func instanceNotReadyMessage(session *sparkv1alpha1.SparkInteractiveSession) string {
+	for _, c := range session.Status.Conditions {
+		if c.Type == sparkv1alpha1.ConditionInstanceReady && c.Status == metav1.ConditionFalse {
+			if c.Message != "" {
+				return c.Message
+			}
+			return c.Reason
+		}
+	}
+	return ""
+}
+
+// terminalReason picks the most informative condition message off a session
+// that landed in Failed/Terminated, so the proxy can surface "quota
+// exceeded" / "pool deleted" / "instance terminated" instead of bare state.
+func terminalReason(session *sparkv1alpha1.SparkInteractiveSession) string {
+	for _, t := range []string{
+		sparkv1alpha1.ConditionQuotaExceeded,
+		sparkv1alpha1.ConditionPoolDeleted,
+		sparkv1alpha1.ConditionInstanceTerminated,
+		sparkv1alpha1.ConditionInstanceReady,
+	} {
+		for _, c := range session.Status.Conditions {
+			if c.Type == t && c.Status == metav1.ConditionTrue && c.Message != "" {
+				return c.Message
+			}
+			if c.Type == t && c.Status == metav1.ConditionFalse && c.Message != "" {
+				return c.Message
+			}
+		}
+	}
+	return ""
 }
 
 // updateLastActivity updates the session's LastActivityAt timestamp and transitions Idle→Active.
@@ -295,22 +399,41 @@ func (p *SessionProxy) updateLastActivity(ctx context.Context, sessionName strin
 	return nil
 }
 
-// StartThriftHTTPProxy starts an HTTP server that reverse-proxies Thrift HTTP transport requests.
-func (p *SessionProxy) StartThriftHTTPProxy(addr string) error {
+// StartThriftHTTPProxy runs the Thrift HTTP reverse proxy until ctx is
+// canceled, then performs a graceful shutdown bounded by proxyShutdownTimeout.
+// It implements the controller-runtime manager.Runnable contract so SIGTERM
+// drains in-flight Thrift requests instead of cutting them mid-query.
+func (p *SessionProxy) StartThriftHTTPProxy(ctx context.Context, addr string) error {
 	server := &http.Server{
-		Addr:    addr,
-		Handler: http.HandlerFunc(p.handleThriftHTTPRequest),
+		Addr:              addr,
+		Handler:           http.HandlerFunc(p.handleThriftHTTPRequest),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 
 	p.log.Info("Starting Thrift HTTP proxy", "addr", addr)
 
+	serveErr := make(chan error, 1)
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			p.log.Error(err, "Thrift HTTP proxy failed")
+			serveErr <- err
+			return
 		}
+		serveErr <- nil
 	}()
 
-	return nil
+	select {
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), proxyShutdownTimeout)
+		defer cancel()
+		p.log.Info("Shutting down Thrift HTTP proxy")
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			p.log.Error(err, "Thrift HTTP proxy graceful shutdown failed")
+			return err
+		}
+		return nil
+	case err := <-serveErr:
+		return err
+	}
 }
 
 // handleThriftHTTPRequest handles a single Thrift HTTP transport request.
@@ -386,7 +509,11 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 	endpoint, err := p.resolveEndpoint(ctx, sessionName)
 	if err != nil {
 		p.log.Error(err, "Session did not become active", "session", sessionName)
-		http.Error(w, "session failed to start", http.StatusServiceUnavailable)
+		if isQuotaExceeded(err) {
+			http.Error(w, err.Error(), http.StatusTooManyRequests)
+			return
+		}
+		http.Error(w, "session failed to start: "+err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
@@ -409,6 +536,18 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 			req.Host = backendURL.Host
 			req.Header.Set("Authorization", backendAuth)
 		},
+		// On backend transport errors, drop the cached endpoint so the next
+		// request re-resolves against the session CR. We can't retry in-band:
+		// the request body has already been streamed, so the client must
+		// reconnect — but at least it will hit a fresh address and see why
+		// the previous one died (Evicted, OOMKilled, ...) in the 502 body.
+		ErrorHandler: func(rw http.ResponseWriter, req *http.Request, err error) {
+			p.log.Error(err, "Thrift backend transport failed; invalidating endpoint cache",
+				"session", sessionName, "endpoint", endpoint)
+			p.invalidateEndpoint(sessionName)
+			msg := describeOrDefault(p.describeBackendFailure(req.Context(), sessionName), "transport error")
+			http.Error(rw, "backend unavailable: "+msg, http.StatusBadGateway)
+		},
 	}
 
 	p.log.V(1).Info("Thrift HTTP proxying request", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint)
@@ -423,8 +562,8 @@ func (p *SessionProxy) handleThriftHTTPRequest(w http.ResponseWriter, r *http.Re
 
 // resolveEndpoint returns a cached endpoint for the session, or waits for it to become active.
 func (p *SessionProxy) resolveEndpoint(ctx context.Context, sessionName string) (string, error) {
-	if cached, ok := p.endpoints.Load(sessionName); ok {
-		return cached.(string), nil
+	if cached, ok := p.endpoints.get(sessionName); ok {
+		return cached, nil
 	}
 
 	endpoint, err := p.waitForSessionActive(ctx, sessionName)
@@ -432,12 +571,87 @@ func (p *SessionProxy) resolveEndpoint(ctx context.Context, sessionName string) 
 		return "", err
 	}
 
-	p.endpoints.Store(sessionName, endpoint)
+	p.endpoints.set(sessionName, endpoint)
 	return endpoint, nil
 }
 
-// StartConnectProxy starts the gRPC server for Spark Connect connections.
-func (p *SessionProxy) StartConnectProxy(addr string) error {
+// invalidateEndpoint drops a cached endpoint so the next resolve goes back to
+// the session CR. Used when a backend connection fails — usually because the
+// driver pod restarted with a new IP — so the next request gets a fresh
+// address instead of replaying the stale one.
+func (p *SessionProxy) invalidateEndpoint(sessionName string) {
+	p.endpoints.delete(sessionName)
+}
+
+// describeOrDefault returns specific when non-empty, otherwise generic.
+// Keeps the error-construction sites at the call sites tidy.
+func describeOrDefault(specific, generic string) string {
+	if specific != "" {
+		return specific
+	}
+	return generic
+}
+
+// describeBackendFailure converts a generic transport failure into a
+// specific cause by inspecting the driver pod's status. Returns a short
+// human-readable phrase (e.g. "driver pod Evicted", "driver container
+// OOMKilled") or "" when no useful signal is available. Bounded by
+// backendFailureProbeTimeout so a slow apiserver doesn't pile latency on top
+// of an already-failing request.
+func (p *SessionProxy) describeBackendFailure(ctx context.Context, sessionName string) string {
+	probeCtx, cancel := context.WithTimeout(ctx, backendFailureProbeTimeout)
+	defer cancel()
+
+	session := &sparkv1alpha1.SparkInteractiveSession{}
+	if err := p.client.Get(probeCtx, client.ObjectKey{Namespace: p.namespace, Name: sessionName}, session); err != nil {
+		return ""
+	}
+	if session.Status.AssignedInstance == "" {
+		return ""
+	}
+
+	pod := &corev1.Pod{}
+	if err := p.client.Get(probeCtx, client.ObjectKey{
+		Namespace: p.namespace,
+		Name:      session.Status.AssignedInstance + "-driver",
+	}, pod); err != nil {
+		return ""
+	}
+
+	// Pod-level reason: node eviction, graceful node shutdown, etc.
+	if pod.Status.Reason != "" {
+		return "driver pod " + pod.Status.Reason
+	}
+	// Container termination reason: OOMKilled, Error, ContainerCannotRun.
+	// Prefer the current state's reason, then fall back to LastTerminationState
+	// (covers the window after a crash where the pod is being recreated).
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.State.Terminated != nil && cs.State.Terminated.Reason != "" {
+			return "driver container " + cs.State.Terminated.Reason
+		}
+		if cs.LastTerminationState.Terminated != nil && cs.LastTerminationState.Terminated.Reason != "" {
+			return "driver container " + cs.LastTerminationState.Terminated.Reason
+		}
+	}
+	return ""
+}
+
+// resolveFreshEndpoint forces a re-resolution from the session CR, bypassing
+// the cache. Used as the second attempt after a stale-endpoint failure.
+func (p *SessionProxy) resolveFreshEndpoint(ctx context.Context, sessionName string) (string, error) {
+	p.invalidateEndpoint(sessionName)
+	endpoint, err := p.waitForSessionActive(ctx, sessionName)
+	if err != nil {
+		return "", err
+	}
+	p.endpoints.set(sessionName, endpoint)
+	return endpoint, nil
+}
+
+// StartConnectProxy runs the Spark Connect gRPC server until ctx is canceled,
+// at which point it triggers GracefulStop so active streams can finish
+// (subject to proxyShutdownTimeout) before forcing a Stop.
+func (p *SessionProxy) StartConnectProxy(ctx context.Context, addr string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", addr, err)
@@ -458,58 +672,79 @@ func (p *SessionProxy) StartConnectProxy(addr string) error {
 
 	p.log.Info("Starting Connect gRPC proxy", "addr", addr)
 
+	serveErr := make(chan error, 1)
 	go func() {
-		if err := server.Serve(listener); err != nil {
-			p.log.Error(err, "gRPC server failed")
+		if err := server.Serve(listener); err != nil && err != grpc.ErrServerStopped {
+			serveErr <- err
+			return
 		}
+		serveErr <- nil
 	}()
 
-	return nil
+	select {
+	case <-ctx.Done():
+		// GracefulStop blocks until all active RPCs complete; bound it so a
+		// stuck stream can't keep the pod alive past its terminationGracePeriod.
+		done := make(chan struct{})
+		go func() {
+			server.GracefulStop()
+			close(done)
+		}()
+		p.log.Info("Shutting down Connect gRPC proxy")
+		select {
+		case <-done:
+			return nil
+		case <-time.After(proxyShutdownTimeout):
+			p.log.Info("Connect gRPC proxy graceful shutdown timeout, forcing stop")
+			server.Stop()
+			<-done
+			return nil
+		}
+	case err := <-serveErr:
+		return err
+	}
 }
 
-// handleConnectStream handles a single gRPC stream for Spark Connect.
-func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.ServerStream) error {
-	ctx := serverStream.Context()
-
-	var username, password string
+// authenticateConnect pulls credentials off the gRPC stream and validates them
+// against the configured authenticator. On insecure channels where gRPC metadata
+// credentials aren't available, it reads the first protobuf message to recover
+// user_context.user_id; that frame is returned so the caller can forward it to
+// the backend after the proxy hop has been established.
+func (p *SessionProxy) authenticateConnect(ctx context.Context, serverStream grpc.ServerStream) (*auth.UserInfo, *rawFrame, error) {
 	var firstMsg *rawFrame
-
-	// 1. Try gRPC metadata auth first (works on TLS channels)
 	username, password, metaErr := extractCredentialsFromGRPCMetadata(ctx)
 	if metaErr != nil {
-		// 2. Fall back: read the first protobuf message and extract user_context.user_id.
-		//    On insecure channels PySpark cannot send gRPC metadata credentials,
-		//    but user_id is always embedded in the protobuf request body.
-		//    Users set it via: sc://host:port/;user_id=base64(user:pass)
-		//    or:               sc://host:port/;user_id=username
+		// PySpark on insecure channels can't send gRPC metadata creds, but
+		// user_id is always embedded in the protobuf request body via
+		// sc://host:port/;user_id=base64(user:pass) (or bare username).
 		firstMsg = &rawFrame{}
 		if err := serverStream.RecvMsg(firstMsg); err != nil {
 			p.log.Error(err, "Failed to read first gRPC message")
-			return status.Errorf(codes.Internal, "failed to read request: %v", err)
+			return nil, nil, status.Errorf(codes.Internal, "failed to read request: %v", err)
 		}
-
 		var protoErr error
 		username, password, protoErr = extractCredentialsFromProto(firstMsg.payload)
 		if protoErr != nil {
 			p.log.Error(protoErr, "Failed to extract credentials from protobuf")
-			return status.Errorf(codes.Unauthenticated,
+			return nil, nil, status.Errorf(codes.Unauthenticated,
 				"missing credentials: set user_id in sc:// URL, e.g. sc://host:port/;user_id=base64(user:pass)")
 		}
 	}
 
-	// 3. Authenticate via Keycloak ROPC (or skip-validation)
 	userInfo, err := p.auth.AuthenticateWithCredentials(ctx, username, password)
 	if err != nil {
 		p.log.Error(err, "Credential authentication failed", "user", username)
-		return status.Errorf(codes.Unauthenticated, "authentication failed")
+		return nil, nil, status.Errorf(codes.Unauthenticated, "authentication failed")
 	}
+	return userInfo, firstMsg, nil
+}
 
-	p.log.Info("Connect user authenticated", "user", userInfo.Username)
-
-	// 4. Find pool by hostname-based routing.
-	// Prefer x-forwarded-host (set by nginx ingress) over :authority,
-	// because nginx rewrites :authority to the upstream service name
-	// when proxying gRPC, losing the original client hostname.
+// resolveConnectPool maps the inbound gRPC request to a pool. Hostname routing
+// prefers x-forwarded-host (set by nginx ingress) over :authority because nginx
+// rewrites :authority to the upstream service name when proxying gRPC, losing
+// the original client hostname. Returns a gRPC status error suitable for return
+// to the client.
+func (p *SessionProxy) resolveConnectPool(ctx context.Context) (string, error) {
 	host := ""
 	if md, ok := metadata.FromIncomingContext(ctx); ok {
 		if vals := md.Get("x-forwarded-host"); len(vals) > 0 {
@@ -518,88 +753,125 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 			host = vals[0]
 		}
 	}
-	// Strip port if present
 	if idx := strings.LastIndex(host, ":"); idx > 0 {
 		host = host[:idx]
 	}
-	p.log.V(1).Info("Connect routing", "host", host, "user", userInfo.Username)
+	p.log.V(1).Info("Connect routing", "host", host)
 
-	var poolName string
-	if host != "" {
-		var poolType string
-		poolName, poolType, err = p.findPoolByHost(ctx, host)
+	if host == "" {
+		poolName, err := p.findPool(ctx, "connect")
 		if err != nil {
-			p.log.Error(err, "Failed to find pool by host", "host", host, "user", userInfo.Username)
-			return status.Errorf(codes.FailedPrecondition, "%v", err)
+			return "", status.Errorf(codes.FailedPrecondition, "%v", err)
 		}
-		if poolType != "connect" {
-			p.log.Error(nil, "Pool matched by host is not a connect pool", "host", host, "poolType", poolType)
-			return status.Errorf(codes.FailedPrecondition, "pool %q is type %q, expected connect", poolName, poolType)
-		}
-	} else {
-		// Fallback: no host header, use legacy single-pool lookup
-		poolName, err = p.findPool(ctx, "connect")
-		if err != nil {
-			p.log.Error(err, "Failed to find connect pool", "user", userInfo.Username)
-			return status.Errorf(codes.FailedPrecondition, "%v", err)
-		}
+		return poolName, nil
 	}
 
-	// 5. Find existing or create new session
+	poolName, poolType, err := p.findPoolByHost(ctx, host)
+	if err != nil {
+		return "", status.Errorf(codes.FailedPrecondition, "%v", err)
+	}
+	if poolType != "connect" {
+		return "", status.Errorf(codes.FailedPrecondition, "pool %q is type %q, expected connect", poolName, poolType)
+	}
+	return poolName, nil
+}
+
+// dialBackendStream opens a gRPC client connection to endpoint and starts a
+// bidirectional stream for fullMethod. Returns both the connection and the
+// stream so the caller can defer Close() on the connection. Either return is
+// nil if err is non-nil.
+//
+// ForceCodec keeps the content-type as "application/grpc" (which the backend
+// Spark Connect server expects) while still using raw byte passthrough for
+// marshal/unmarshal.
+func (p *SessionProxy) dialBackendStream(ctx context.Context, endpoint, fullMethod string) (*grpc.ClientConn, grpc.ClientStream, error) {
+	backendConn, err := grpc.NewClient("passthrough:///"+endpoint,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                20 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("dial backend %s: %w", endpoint, err)
+	}
+
+	backendStream, err := backendConn.NewStream(ctx, &grpc.StreamDesc{
+		ServerStreams: true,
+		ClientStreams: true,
+	}, fullMethod, grpc.ForceCodec(rawCodec{}))
+	if err != nil {
+		backendConn.Close()
+		return nil, nil, fmt.Errorf("open backend stream %s: %w", fullMethod, err)
+	}
+	return backendConn, backendStream, nil
+}
+
+// handleConnectStream handles a single gRPC stream for Spark Connect.
+func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.ServerStream) error {
+	ctx := serverStream.Context()
+
+	userInfo, firstMsg, err := p.authenticateConnect(ctx, serverStream)
+	if err != nil {
+		return err
+	}
+	p.log.Info("Connect user authenticated", "user", userInfo.Username)
+
+	poolName, err := p.resolveConnectPool(ctx)
+	if err != nil {
+		p.log.Error(err, "Failed to resolve connect pool", "user", userInfo.Username)
+		return err
+	}
+
 	sessionName, err := p.findOrCreateSession(ctx, userInfo.Username, poolName)
 	if err != nil {
 		p.log.Error(err, "Failed to find/create session", "user", userInfo.Username, "pool", poolName)
 		return status.Errorf(codes.Internal, "failed to create session")
 	}
 
-	// 6. Wait for session to become active
-	endpoint, err := p.waitForSessionActive(ctx, sessionName)
+	endpoint, err := p.resolveEndpoint(ctx, sessionName)
 	if err != nil {
 		p.log.Error(err, "Session did not become active", "session", sessionName)
-		return status.Errorf(codes.Unavailable, "session failed to start")
+		if isQuotaExceeded(err) {
+			return status.Errorf(codes.ResourceExhausted, "%s", err.Error())
+		}
+		return status.Errorf(codes.Unavailable, "session failed to start: %s", err.Error())
 	}
 
-	// 7. Connect to backend gRPC server
-	// Use ForceCodec (not CallContentSubtype) so the content-type stays as
-	// "application/grpc" which the backend Spark Connect server expects,
-	// while still using raw byte passthrough for marshal/unmarshal.
-	backendConn, err := grpc.NewClient("passthrough:///"+endpoint,
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithDefaultCallOptions(grpc.ForceCodec(rawCodec{})),
-		grpc.WithKeepaliveParams(keepalive.ClientParameters{
-			Time:                20 * time.Second, // ping backend every 20s if idle
-			Timeout:             10 * time.Second,  // wait 10s for ping ack
-			PermitWithoutStream: true,
-		}),
-	)
-	if err != nil {
-		p.log.Error(err, "Failed to connect to backend", "endpoint", endpoint, "session", sessionName)
-		return status.Errorf(codes.Unavailable, "backend connection failed")
-	}
-	defer backendConn.Close()
-
-	// Get the full method name from the transport stream
 	fullMethod, ok := grpc.MethodFromServerStream(serverStream)
 	if !ok {
 		return status.Errorf(codes.Internal, "failed to get method name")
 	}
 
-	// 8. Create backend client stream
+	// Try the cached endpoint first; if the dial or stream creation fails the
+	// driver may have restarted with a new IP, so invalidate the cache and try
+	// once with a freshly resolved address before giving up.
 	backendCtx, backendCancel := context.WithCancel(ctx)
 	defer backendCancel()
 
-	backendStream, err := backendConn.NewStream(backendCtx, &grpc.StreamDesc{
-		ServerStreams: true,
-		ClientStreams: true,
-	}, fullMethod, grpc.ForceCodec(rawCodec{}))
+	backendConn, backendStream, err := p.dialBackendStream(backendCtx, endpoint, fullMethod)
 	if err != nil {
-		p.log.Error(err, "Failed to create backend stream", "session", sessionName, "method", fullMethod)
-		return status.Errorf(codes.Unavailable, "backend stream failed")
+		p.log.Info("Backend dial failed on cached endpoint; re-resolving", "session", sessionName, "endpoint", endpoint, "error", err.Error())
+		fresh, resolveErr := p.resolveFreshEndpoint(ctx, sessionName)
+		if resolveErr != nil {
+			p.log.Error(resolveErr, "Failed to re-resolve endpoint", "session", sessionName)
+			return status.Errorf(codes.Unavailable, "backend unavailable: %s", describeOrDefault(p.describeBackendFailure(ctx, sessionName), resolveErr.Error()))
+		}
+		endpoint = fresh
+		backendConn, backendStream, err = p.dialBackendStream(backendCtx, endpoint, fullMethod)
+		if err != nil {
+			p.log.Error(err, "Backend dial failed after re-resolve", "session", sessionName, "endpoint", endpoint)
+			return status.Errorf(codes.Unavailable, "backend stream failed: %s", describeOrDefault(p.describeBackendFailure(ctx, sessionName), err.Error()))
+		}
 	}
+	defer backendConn.Close()
 
 	p.log.Info("Connect session proxying started", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint, "method", fullMethod)
 
-	// 9. If we consumed the first message for auth, forward it to the backend now
+	// If we consumed the first message during auth, forward it to the backend
+	// before the bidirectional pump starts so message ordering is preserved.
 	if firstMsg != nil {
 		if err := backendStream.SendMsg(firstMsg); err != nil {
 			p.log.Error(err, "Failed to forward first message to backend", "session", sessionName)
@@ -665,7 +937,15 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	return nil
 }
 
-// runKeepalive periodically updates LastActivityAt for the session.
+// runKeepalive periodically updates LastActivityAt for the session. Each
+// update is bounded by keepaliveUpdateTimeout and tied to the keepalive
+// context so a cancelled stream cleans up promptly instead of letting an
+// in-flight apiserver write outlive the session.
+//
+// Exits early on NotFound — the session CR has been deleted (idle timeout,
+// pool teardown, explicit user delete) and the surrounding gRPC stream will
+// see EOF on its own. Without this short-circuit the loop would log an
+// error every keepaliveInterval until the stream noticed independently.
 func (p *SessionProxy) runKeepalive(ctx context.Context, sessionName string) {
 	ticker := time.NewTicker(keepaliveInterval)
 	defer ticker.Stop()
@@ -675,9 +955,17 @@ func (p *SessionProxy) runKeepalive(ctx context.Context, sessionName string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := p.updateLastActivity(context.Background(), sessionName); err != nil {
-				p.log.Error(err, "Keepalive update failed", "session", sessionName)
+			updateCtx, cancel := context.WithTimeout(ctx, keepaliveUpdateTimeout)
+			err := p.updateLastActivity(updateCtx, sessionName)
+			cancel()
+			if err == nil {
+				continue
 			}
+			if apierrors.IsNotFound(err) {
+				p.log.Info("Keepalive stopping: session no longer exists", "session", sessionName)
+				return
+			}
+			p.log.Error(err, "Keepalive update failed", "session", sessionName)
 		}
 	}
 }

@@ -2,12 +2,18 @@ name: Lint
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: lint-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   lint:
-    name: Run on Ubuntu
+    name: golangci-lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -16,8 +22,12 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          cache: true
 
       - name: Run linter
         uses: golangci/golangci-lint-action@v8
         with:
           version: v2.8.0
+          # The action manages its own cache; this just gives us a longer
+          # window to finish on a cold cache without timing out.
+          args: --timeout=5m

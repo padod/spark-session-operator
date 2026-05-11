@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -32,6 +33,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -205,9 +207,10 @@ func main() {
 		os.Exit(1)
 	}
 	if err := (&controller.SparkInteractiveSessionReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-		Log:    ctrl.Log.WithName("controllers").WithName("SparkInteractiveSession"),
+		Client:    mgr.GetClient(),
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Log:       ctrl.Log.WithName("controllers").WithName("SparkInteractiveSession"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "SparkInteractiveSession")
 		os.Exit(1)
@@ -223,8 +226,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate OIDC configuration before wiring the authenticator. The
+	// SkipValidation path bypasses signature verification; refusing to
+	// start without an explicit opt-in prevents a misconfigured Helm
+	// values file (missing oidc-issuer-url) from silently accepting any
+	// JWT.
+	if oidcIssuerURL == "" && !oidcSkipValidation {
+		setupLog.Error(nil, "OIDC issuer URL is required; set --oidc-issuer-url or pass --oidc-skip-validation explicitly")
+		os.Exit(1)
+	}
+	if oidcSkipValidation {
+		setupLog.Error(nil, "WARNING: --oidc-skip-validation is enabled; JWT signatures are NOT verified. DO NOT use in production.")
+	}
+
 	// Create shared authenticator
-	authenticator := auth.NewAuthenticator(auth.OIDCConfig{
+	authenticator, err := auth.NewAuthenticator(auth.OIDCConfig{
 		IssuerURL:      oidcIssuerURL,
 		Audience:       oidcAudience,
 		ClientID:       oidcClientID,
@@ -233,32 +249,44 @@ func main() {
 		GroupsClaim:    oidcGroupsClaim,
 		SkipValidation: oidcSkipValidation,
 	})
+	if err != nil {
+		setupLog.Error(err, "Failed to create authenticator")
+		os.Exit(1)
+	}
 
-	// Start REST API gateway
+	// Wire long-running components (gateway + proxies) into the controller
+	// manager so SIGTERM triggers a coordinated graceful shutdown: leader
+	// election release, controller drain, then HTTP/gRPC drain — all bounded
+	// by the manager's gracefulShutdownTimeout.
 	gw := gateway.NewSessionGateway(
 		mgr.GetClient(),
 		ctrl.Log,
 		namespace,
 		authenticator,
 	)
-	go func() {
-		if err := gw.Start(gatewayAddr); err != nil {
-			setupLog.Error(err, "gateway server failed")
-			os.Exit(1)
-		}
-	}()
+	if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		return gw.Run(ctx, gatewayAddr)
+	})); err != nil {
+		setupLog.Error(err, "failed to register gateway with manager")
+		os.Exit(1)
+	}
 
-	// Start proxies
 	sessionProxy := proxy.NewSessionProxy(mgr.GetClient(), ctrl.Log, namespace, authenticator)
 	if thriftProxyAddr != "" {
-		if err := sessionProxy.StartThriftHTTPProxy(thriftProxyAddr); err != nil {
-			setupLog.Error(err, "failed to start thrift proxy")
+		addr := thriftProxyAddr
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return sessionProxy.StartThriftHTTPProxy(ctx, addr)
+		})); err != nil {
+			setupLog.Error(err, "failed to register thrift proxy with manager")
 			os.Exit(1)
 		}
 	}
 	if connectProxyAddr != "" {
-		if err := sessionProxy.StartConnectProxy(connectProxyAddr); err != nil {
-			setupLog.Error(err, "failed to start connect proxy")
+		addr := connectProxyAddr
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return sessionProxy.StartConnectProxy(ctx, addr)
+		})); err != nil {
+			setupLog.Error(err, "failed to register connect proxy with manager")
 			os.Exit(1)
 		}
 	}

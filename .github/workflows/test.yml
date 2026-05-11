@@ -2,12 +2,20 @@ name: Tests
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Cancel in-flight runs on the same branch when a new commit arrives. Saves
+# CI minutes — the older result was about to be invalidated anyway.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
-    name: Run on Ubuntu
+    name: Unit + integration (envtest)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -16,8 +24,51 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+          # setup-go's built-in module cache, keyed on go.sum
+          cache: true
 
-      - name: Running Tests
+      # Cache the locally-installed tools (controller-gen, setup-envtest,
+      # golangci-lint) AND the downloaded envtest K8s binaries. Without this
+      # every run pulls ~100 MB of kube-apiserver/etcd binaries.
+      - name: Cache envtest + tool binaries
+        uses: actions/cache@v4
+        with:
+          path: bin/
+          key: ${{ runner.os }}-envtest-${{ hashFiles('Makefile', 'go.mod') }}
+          restore-keys: |
+            ${{ runner.os }}-envtest-
+
+      # Verify go.sum is consistent with go.mod without mutating either.
+      # The old workflow ran `go mod tidy`, which silently rewrites the
+      # lockfile and hides the real state from review.
+      - name: Verify Go modules
         run: |
-          go mod tidy
-          make test
+          go mod download
+          go mod verify
+
+      # Catch the "I changed an API type but forgot to run make generate"
+      # case before it lands. controller-runtime's DeepCopy and the RBAC
+      # role.yaml are both committed; CI should fail if regenerating them
+      # produces a diff.
+      - name: Verify generated code is committed
+        run: |
+          make manifests generate
+          if ! git diff --exit-code -- api/ config/crd config/rbac; then
+            echo "::error::Generated files are out of date. Run 'make manifests generate' and commit the result."
+            exit 1
+          fi
+
+      # Race detector ON. The controller-runtime cache + manual Reconcile
+      # call in suite_test.go exercises real concurrency; race detector
+      # catches the kind of bugs the resilience-hardening pass fixed.
+      # count=1 disables Go's test result cache so flakes surface.
+      - name: Run unit + envtest suite
+        run: make test-race
+
+      - name: Upload coverage
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: cover.out
+          retention-days: 7
