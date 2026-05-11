@@ -9,3 +9,8 @@
 # Re-include Go module files
 !go.mod
 !go.sum
+
+# Re-include embedded resources referenced by //go:embed directives.
+# Without this the Docker build fails with "pattern templates/...: no matching
+# files found" because the allow-list above only re-included *.go.
+!**/templates/**

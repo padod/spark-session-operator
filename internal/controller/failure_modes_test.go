@@ -79,7 +79,8 @@ func TestMarkSessionsFailedForInstance(t *testing.T) {
 		Build()
 
 	r := &SparkSessionPoolReconciler{Client: cli, Scheme: scheme}
-	if err := r.markSessionsFailedForInstance(context.Background(), logr.Discard(), testNamespace, "instance-going-away", "scale-down"); err != nil {
+	ctx := logr.NewContext(context.Background(), logr.Discard())
+	if err := r.markSessionsFailedForInstance(ctx, testNamespace, "instance-going-away", "scale-down"); err != nil {
 		t.Fatalf("markSessionsFailedForInstance: %v", err)
 	}
 
@@ -149,7 +150,8 @@ func TestCascadeFailSessionsForPool(t *testing.T) {
 		Build()
 
 	r := &SparkSessionPoolReconciler{Client: cli, Scheme: scheme}
-	if err := r.cascadeFailSessionsForPool(context.Background(), logr.Discard(), pool); err != nil {
+	ctx := logr.NewContext(context.Background(), logr.Discard())
+	if err := r.cascadeFailSessionsForPool(ctx, pool); err != nil {
 		t.Fatalf("cascadeFailSessionsForPool: %v", err)
 	}
 
@@ -212,7 +214,8 @@ func TestSurfaceInstanceReadyError(t *testing.T) {
 		Build()
 
 	r := &SparkInteractiveSessionReconciler{Client: cli, APIReader: cli, Scheme: scheme, Log: logr.Discard()}
-	r.surfaceInstanceReadyError(context.Background(), logr.Discard(), session, errAssign("no running instances available in pool p"))
+	ctx := logr.NewContext(context.Background(), logr.Discard())
+	r.surfaceInstanceReadyError(ctx, session, errAssign("no running instances available in pool p"))
 
 	c := apimeta.FindStatusCondition(session.Status.Conditions, sparkv1alpha1.ConditionInstanceReady)
 	if c == nil {

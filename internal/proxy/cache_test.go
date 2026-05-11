@@ -111,7 +111,7 @@ func TestTTLMap_Operations(t *testing.T) {
 func TestTTLMap_SweepUnderPressure(t *testing.T) {
 	m := newTTLMap(10 * time.Millisecond)
 	// Fill past the sweep threshold with entries that will expire immediately.
-	for i := 0; i < ttlCacheSweepThreshold+10; i++ {
+	for i := range ttlCacheSweepThreshold + 10 {
 		m.set(itoa(i), "v")
 	}
 	// Force m.lastSweep to be old enough that the next set() triggers a sweep.

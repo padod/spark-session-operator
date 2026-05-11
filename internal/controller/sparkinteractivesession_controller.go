@@ -75,7 +75,11 @@ type SparkInteractiveSessionReconciler struct {
 // +kubebuilder:rbac:groups=sparkoperator.k8s.io,resources=sparkapplications,verbs=get;list;watch
 
 func (r *SparkInteractiveSessionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	// Per logcheck/kube convention, attach the logger to the context once
+	// here and let helpers pull it out via logr.FromContext, rather than
+	// passing (ctx, log) everywhere.
 	log := r.Log.WithValues("session", req.NamespacedName)
+	ctx = logr.NewContext(ctx, log)
 
 	session := &sparkv1alpha1.SparkInteractiveSession{}
 	if err := r.Get(ctx, req.NamespacedName, session); err != nil {
@@ -85,12 +89,10 @@ func (r *SparkInteractiveSessionReconciler) Reconcile(ctx context.Context, req c
 		return ctrl.Result{}, err
 	}
 
-	// Handle deletion
 	if !session.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, log, session)
+		return r.handleDeletion(ctx, session)
 	}
 
-	// Ensure finalizer
 	if !controllerutil.ContainsFinalizer(session, sessionFinalizer) {
 		controllerutil.AddFinalizer(session, sessionFinalizer)
 		if err := r.Update(ctx, session); err != nil {
@@ -99,14 +101,13 @@ func (r *SparkInteractiveSessionReconciler) Reconcile(ctx context.Context, req c
 	}
 
 	switch session.Status.State {
-	case "", "Pending":
-		return r.handlePending(ctx, log, session)
-	case "Active", "Idle":
-		return r.handleActive(ctx, log, session)
-	case "Terminating":
-		return r.handleTerminating(ctx, log, session)
-	case "Terminated", "Failed":
-		// Terminal states — nothing to do
+	case "", sparkv1alpha1.SessionStatePending:
+		return r.handlePending(ctx, session)
+	case sparkv1alpha1.SessionStateActive, sparkv1alpha1.SessionStateIdle:
+		return r.handleActive(ctx, session)
+	case sparkv1alpha1.SessionStateTerminating:
+		return r.handleTerminating(ctx, session)
+	case sparkv1alpha1.SessionStateTerminated, sparkv1alpha1.SessionStateFailed:
 		return ctrl.Result{}, nil
 	}
 
@@ -115,12 +116,12 @@ func (r *SparkInteractiveSessionReconciler) Reconcile(ctx context.Context, req c
 
 func (r *SparkInteractiveSessionReconciler) handlePending(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 ) (ctrl.Result, error) {
+	log := logr.FromContextOrDiscard(ctx)
 	if err := r.validateQuota(ctx, session); err != nil {
 		log.Info("Quota exceeded", "user", session.Spec.User, "error", err)
-		session.Status.State = "Failed"
+		session.Status.State = sparkv1alpha1.SessionStateFailed
 		apimeta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 			Type:    sparkv1alpha1.ConditionQuotaExceeded,
 			Status:  metav1.ConditionTrue,
@@ -130,7 +131,7 @@ func (r *SparkInteractiveSessionReconciler) handlePending(
 		return ctrl.Result{}, r.Status().Update(ctx, session)
 	}
 
-	instance, endpoint, err := r.assignToInstance(ctx, log, session)
+	instance, endpoint, err := r.assignToInstance(ctx, session)
 	if err != nil {
 		log.Info("Cannot assign session to instance yet", "user", session.Spec.User, "error", err.Error())
 		// If we've been waiting past the threshold, look for an underlying
@@ -138,7 +139,7 @@ func (r *SparkInteractiveSessionReconciler) handlePending(
 		// something more specific than "session failed to start" when the
 		// 60 s waitForSessionActive timeout fires.
 		if time.Since(session.CreationTimestamp.Time) > pendingInstanceProbeThreshold {
-			r.surfaceInstanceReadyError(ctx, log, session, err)
+			r.surfaceInstanceReadyError(ctx, session, err)
 			if updateErr := r.Status().Update(ctx, session); updateErr != nil {
 				log.Error(updateErr, "Failed to update session InstanceReady condition")
 			}
@@ -156,14 +157,12 @@ func (r *SparkInteractiveSessionReconciler) handlePending(
 		if err := r.Get(ctx, client.ObjectKeyFromObject(session), fresh); err != nil {
 			return err
 		}
-		if fresh.Status.State != "" && fresh.Status.State != "Pending" {
-			// Another reconcile won the race and already advanced state;
-			// don't clobber it.
+		if fresh.Status.State != "" && fresh.Status.State != sparkv1alpha1.SessionStatePending {
 			return nil
 		}
 		apimeta.RemoveStatusCondition(&fresh.Status.Conditions, sparkv1alpha1.ConditionInstanceReady)
 		now := metav1.Now()
-		fresh.Status.State = "Active"
+		fresh.Status.State = sparkv1alpha1.SessionStateActive
 		fresh.Status.AssignedInstance = instance
 		fresh.Status.Endpoint = endpoint
 		fresh.Status.CreatedAt = &now
@@ -183,10 +182,10 @@ func (r *SparkInteractiveSessionReconciler) handlePending(
 // other than a generic timeout.
 func (r *SparkInteractiveSessionReconciler) surfaceInstanceReadyError(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 	assignErr error,
 ) {
+	log := logr.FromContextOrDiscard(ctx)
 	apps := &unstructured.UnstructuredList{}
 	apps.SetGroupVersionKind(schema.GroupVersionKind{
 		Group:   sparkApplicationGVK.Group,
@@ -245,27 +244,24 @@ func (r *SparkInteractiveSessionReconciler) surfaceInstanceReadyError(
 
 func (r *SparkInteractiveSessionReconciler) handleActive(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 ) (ctrl.Result, error) {
-	// Check if assigned instance is still running
+	log := logr.FromContextOrDiscard(ctx)
 	pool := &sparkv1alpha1.SparkSessionPool{}
 	if err := r.Get(ctx, client.ObjectKey{
 		Namespace: session.Namespace,
 		Name:      session.Spec.Pool,
 	}, pool); err != nil {
 		if errors.IsNotFound(err) {
-			// Pool was deleted — terminate session
-			session.Status.State = "Terminated"
+			session.Status.State = sparkv1alpha1.SessionStateTerminated
 			return ctrl.Result{}, r.Status().Update(ctx, session)
 		}
 		return ctrl.Result{}, err
 	}
 
-	// Check if instance is still alive
 	instanceAlive := false
 	for _, inst := range pool.Status.Instances {
-		if inst.Name == session.Status.AssignedInstance && inst.State == "Running" {
+		if inst.Name == session.Status.AssignedInstance && inst.State == sparkv1alpha1.InstanceStateRunning {
 			instanceAlive = true
 			break
 		}
@@ -279,7 +275,7 @@ func (r *SparkInteractiveSessionReconciler) handleActive(
 		log.Info("Assigned instance is no longer running; marking session Failed",
 			"user", session.Spec.User,
 			"oldInstance", session.Status.AssignedInstance)
-		session.Status.State = "Failed"
+		session.Status.State = sparkv1alpha1.SessionStateFailed
 		apimeta.SetStatusCondition(&session.Status.Conditions, metav1.Condition{
 			Type:    sparkv1alpha1.ConditionInstanceTerminated,
 			Status:  metav1.ConditionTrue,
@@ -289,10 +285,9 @@ func (r *SparkInteractiveSessionReconciler) handleActive(
 		return ctrl.Result{}, r.Status().Update(ctx, session)
 	}
 
-	// Check idle timeout
 	idleTimeout := time.Duration(pool.Spec.SessionPolicy.IdleTimeoutMinutes) * time.Minute
 	if idleTimeout == 0 {
-		idleTimeout = 12 * time.Hour // default
+		idleTimeout = 12 * time.Hour
 	}
 
 	if session.Status.LastActivityAt != nil {
@@ -302,13 +297,12 @@ func (r *SparkInteractiveSessionReconciler) handleActive(
 				"user", session.Spec.User,
 				"idle", idleDuration.String(),
 				"timeout", idleTimeout.String())
-			session.Status.State = "Terminating"
+			session.Status.State = sparkv1alpha1.SessionStateTerminating
 			return ctrl.Result{Requeue: true}, r.Status().Update(ctx, session)
 		}
 
-		// Mark as idle if inactive for more than 10 minutes
-		if idleDuration > 10*time.Minute && session.Status.State == "Active" {
-			session.Status.State = "Idle"
+		if idleDuration > 10*time.Minute && session.Status.State == sparkv1alpha1.SessionStateActive {
+			session.Status.State = sparkv1alpha1.SessionStateIdle
 			if err := r.Status().Update(ctx, session); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -321,25 +315,22 @@ func (r *SparkInteractiveSessionReconciler) handleActive(
 
 func (r *SparkInteractiveSessionReconciler) handleTerminating(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 ) (ctrl.Result, error) {
-	// TODO: actively close the Spark session on the server via JDBC/gRPC
-	// For now, just mark as terminated
+	log := logr.FromContextOrDiscard(ctx)
+	// TODO: actively close the Spark session on the server via JDBC/gRPC.
 	log.Info("Terminating session", "user", session.Spec.User, "instance", session.Status.AssignedInstance)
-	session.Status.State = "Terminated"
+	session.Status.State = sparkv1alpha1.SessionStateTerminated
 	return ctrl.Result{}, r.Status().Update(ctx, session)
 }
 
 func (r *SparkInteractiveSessionReconciler) handleDeletion(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 ) (ctrl.Result, error) {
+	log := logr.FromContextOrDiscard(ctx)
 	if controllerutil.ContainsFinalizer(session, sessionFinalizer) {
-		// Cleanup: close session on the backend if needed
 		log.Info("Cleaning up session", "user", session.Spec.User)
-
 		controllerutil.RemoveFinalizer(session, sessionFinalizer)
 		if err := r.Update(ctx, session); err != nil {
 			return ctrl.Result{}, err
@@ -380,7 +371,9 @@ func (r *SparkInteractiveSessionReconciler) validateQuota(
 		if s.Name == session.Name {
 			continue // don't count self
 		}
-		if s.Status.State == "Active" || s.Status.State == "Idle" || s.Status.State == "Pending" {
+		if s.Status.State == sparkv1alpha1.SessionStateActive ||
+			s.Status.State == sparkv1alpha1.SessionStateIdle ||
+			s.Status.State == sparkv1alpha1.SessionStatePending {
 			totalSessionCount++
 			if s.Spec.User == session.Spec.User {
 				userSessionCount++
@@ -412,10 +405,8 @@ func (r *SparkInteractiveSessionReconciler) validateQuota(
 
 func (r *SparkInteractiveSessionReconciler) assignToInstance(
 	ctx context.Context,
-	log logr.Logger,
 	session *sparkv1alpha1.SparkInteractiveSession,
 ) (string, string, error) {
-	// Get pool status
 	pool := &sparkv1alpha1.SparkSessionPool{}
 	if err := r.Get(ctx, client.ObjectKey{
 		Namespace: session.Namespace,
@@ -424,13 +415,13 @@ func (r *SparkInteractiveSessionReconciler) assignToInstance(
 		return "", "", err
 	}
 
-	// Find instance with least sessions that is Running (not Draining)
+	// Find instance with least sessions that is Running (not Draining).
 	var bestInstance *sparkv1alpha1.PoolInstanceStatus
-	var bestSessions int32 = int32(^uint32(0) >> 1) // max int32
+	bestSessions := int32(^uint32(0) >> 1) // max int32
 
 	for i := range pool.Status.Instances {
 		inst := &pool.Status.Instances[i]
-		if inst.State != "Running" {
+		if inst.State != sparkv1alpha1.InstanceStateRunning {
 			continue
 		}
 		if inst.ActiveSessions < bestSessions {
@@ -443,17 +434,15 @@ func (r *SparkInteractiveSessionReconciler) assignToInstance(
 		return "", "", fmt.Errorf("no running instances available in pool %s", pool.Name)
 	}
 
-	// Build endpoint with the appropriate port
 	port := ""
 	switch pool.Spec.Type {
-	case "thrift":
+	case sparkv1alpha1.PoolTypeThrift:
 		port = "10001" // HiveServer2 HTTP transport port
-	case "connect":
+	case sparkv1alpha1.PoolTypeConnect:
 		port = "8424" // TODO: make configurable from pool spec
 	}
 
 	endpoint := fmt.Sprintf("%s:%s", bestInstance.Endpoint, port)
-
 	return bestInstance.Name, endpoint, nil
 }
 

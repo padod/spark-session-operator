@@ -104,7 +104,8 @@ func main() {
 		oidcClientSecret   string
 	)
 	flag.StringVar(&namespace, "namespace", "spark-dev", "Namespace where pools and sessions live.")
-	flag.StringVar(&proxyNamespace, "proxy-namespace", "spark-session-operator", "Namespace where the proxy Service and Ingresses live.")
+	flag.StringVar(&proxyNamespace, "proxy-namespace", "spark-session-operator",
+		"Namespace where the proxy Service and Ingresses live.")
 	flag.StringVar(&gatewayAddr, "gateway-addr", ":8080", "Address for the REST API gateway.")
 	flag.StringVar(&thriftProxyAddr, "thrift-proxy-addr", ":10009", "Address for the Thrift HTTP proxy.")
 	flag.StringVar(&connectProxyAddr, "connect-proxy-addr", ":15002", "Address for the Spark Connect gRPC proxy.")
@@ -236,7 +237,8 @@ func main() {
 		os.Exit(1)
 	}
 	if oidcSkipValidation {
-		setupLog.Error(nil, "WARNING: --oidc-skip-validation is enabled; JWT signatures are NOT verified. DO NOT use in production.")
+		setupLog.Error(nil,
+			"WARNING: --oidc-skip-validation is enabled; JWT signatures are NOT verified. DO NOT use in production.")
 	}
 
 	// Create shared authenticator

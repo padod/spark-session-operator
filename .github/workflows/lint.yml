@@ -24,10 +24,19 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Run linter
-        uses: golangci/golangci-lint-action@v8
+      # Cache the locally-built golangci-lint binary across runs. The
+      # Makefile's golangci-lint target builds a *custom* binary with the
+      # logcheck module plugin baked in (per .custom-gcl.yml), which the
+      # stock golangci-lint-action does not — using that action here would
+      # fail with "plugin logcheck not found" the moment .golangci.yml
+      # enables it.
+      - name: Cache golangci-lint binary
+        uses: actions/cache@v4
         with:
-          version: v2.8.0
-          # The action manages its own cache; this just gives us a longer
-          # window to finish on a cold cache without timing out.
-          args: --timeout=5m
+          path: bin/
+          key: ${{ runner.os }}-golangci-${{ hashFiles('.custom-gcl.yml', '.golangci.yml', 'Makefile') }}
+          restore-keys: |
+            ${{ runner.os }}-golangci-
+
+      - name: Run linter
+        run: make lint

@@ -186,14 +186,12 @@ func parseBasicAuth(header string) (username, password string, err error) {
 		return "", "", fmt.Errorf("invalid base64 in authorization header: %w", err)
 	}
 
-	credentials := string(decoded)
-	idx := strings.IndexByte(credentials, ':')
-	if idx < 0 {
+	user, pass, ok := strings.Cut(string(decoded), ":")
+	if !ok {
 		return "", "", fmt.Errorf("authorization header missing ':' separator (expected base64(user:pass))")
 	}
-
-	username = credentials[:idx]
-	password = credentials[idx+1:]
+	username = user
+	password = pass
 
 	if username == "" {
 		return "", "", fmt.Errorf("empty username in authorization header")
@@ -206,7 +204,7 @@ func parseBasicAuth(header string) (username, password string, err error) {
 // It passes bytes through without proto marshal/unmarshal.
 type rawCodec struct{}
 
-func (rawCodec) Marshal(v interface{}) ([]byte, error) {
+func (rawCodec) Marshal(v any) ([]byte, error) {
 	frame, ok := v.(*rawFrame)
 	if !ok {
 		return nil, fmt.Errorf("rawCodec.Marshal: expected *rawFrame, got %T", v)
@@ -214,7 +212,7 @@ func (rawCodec) Marshal(v interface{}) ([]byte, error) {
 	return frame.payload, nil
 }
 
-func (rawCodec) Unmarshal(data []byte, v interface{}) error {
+func (rawCodec) Unmarshal(data []byte, v any) error {
 	frame, ok := v.(*rawFrame)
 	if !ok {
 		return fmt.Errorf("rawCodec.Unmarshal: expected *rawFrame, got %T", v)

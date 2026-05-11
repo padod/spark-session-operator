@@ -20,6 +20,18 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Session state values mirror the CRD's enum and are used by every actor
+// (session controller, pool controller, proxy, gateway) — keep them as
+// constants so a typo doesn't silently match nothing.
+const (
+	SessionStatePending     = "Pending"
+	SessionStateActive      = "Active"
+	SessionStateIdle        = "Idle"
+	SessionStateTerminating = "Terminating"
+	SessionStateTerminated  = "Terminated"
+	SessionStateFailed      = "Failed"
+)
+
 // Session condition types. Keep these as string constants so the proxy and
 // gateway can branch on them without importing controller internals.
 const (

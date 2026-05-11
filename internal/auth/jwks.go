@@ -49,7 +49,7 @@ const minRSAKeyBits = 2048
 type jwksKey struct {
 	kid string
 	alg string
-	pub interface{} // *rsa.PublicKey or *ecdsa.PublicKey
+	pub any // *rsa.PublicKey or *ecdsa.PublicKey
 }
 
 // jwksCache fetches and caches the issuer's JWKS keys with a fixed TTL.
@@ -112,7 +112,7 @@ func (c *jwksCache) lookupFresh(kid string) (jwksKey, bool) {
 // refreshOnce coalesces concurrent refresh callers via singleflight: only
 // one HTTP fetch is in flight at a time; the rest wait for its result.
 func (c *jwksCache) refreshOnce(ctx context.Context) error {
-	_, err, _ := c.refresh.Do("jwks", func() (interface{}, error) {
+	_, err, _ := c.refresh.Do("jwks", func() (any, error) {
 		return nil, c.doRefresh(ctx)
 	})
 	return err
@@ -157,7 +157,7 @@ func (c *jwksCache) discoverJWKSURI(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("fetch discovery: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("discovery returned HTTP %d", resp.StatusCode)
 	}
@@ -196,7 +196,8 @@ func validateJWKSURI(issuerURL, jwksURI string) error {
 	if got.Host != iss.Host {
 		return fmt.Errorf("jwks_uri host %q does not match issuer host %q", got.Host, iss.Host)
 	}
-	if got.Scheme != "https" && !(iss.Scheme == "http" && got.Scheme == "http") {
+	const schemeHTTP = "http"
+	if got.Scheme != "https" && (iss.Scheme != schemeHTTP || got.Scheme != schemeHTTP) {
 		return fmt.Errorf("jwks_uri scheme %q is not https", got.Scheme)
 	}
 	return nil
@@ -211,7 +212,7 @@ func (c *jwksCache) fetchKeys(ctx context.Context, uri string) (map[string]jwksK
 	if err != nil {
 		return nil, fmt.Errorf("fetch JWKS: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("JWKS returned HTTP %d", resp.StatusCode)
 	}
@@ -259,7 +260,7 @@ func parseJWKS(body []byte) (map[string]jwksKey, error) {
 	return out, nil
 }
 
-func parseJWK(k rawJWK) (interface{}, string, error) {
+func parseJWK(k rawJWK) (any, string, error) {
 	switch k.Kty {
 	case "RSA":
 		return parseRSAJWK(k)
@@ -270,7 +271,7 @@ func parseJWK(k rawJWK) (interface{}, string, error) {
 	}
 }
 
-func parseRSAJWK(k rawJWK) (interface{}, string, error) {
+func parseRSAJWK(k rawJWK) (any, string, error) {
 	n, err := base64URLBigInt(k.N)
 	if err != nil {
 		return nil, "", fmt.Errorf("RSA n: %w", err)
@@ -293,7 +294,7 @@ func parseRSAJWK(k rawJWK) (interface{}, string, error) {
 	return pub, alg, nil
 }
 
-func parseECJWK(k rawJWK) (interface{}, string, error) {
+func parseECJWK(k rawJWK) (any, string, error) {
 	var curve elliptic.Curve
 	switch k.Crv {
 	case "P-256":

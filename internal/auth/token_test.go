@@ -60,9 +60,9 @@ func newTestIDP(t *testing.T) *testIDP {
 	return idp
 }
 
-func (i *testIDP) jwks() map[string]interface{} {
+func (i *testIDP) jwks() map[string]any {
 	pub := i.key.Public().(*rsa.PublicKey)
-	return map[string]interface{}{
+	return map[string]any{
 		"keys": []map[string]string{{
 			"kty": "RSA",
 			"use": "sig",
@@ -93,7 +93,7 @@ func (i *testIDP) sign(t *testing.T, claims jwt.MapClaims, kid string) string {
 
 // unsignedToken crafts a JWT with alg=none — the historic bypass we
 // must reject regardless of issuer/audience/exp validity.
-func unsignedToken(claims map[string]interface{}) string {
+func unsignedToken(claims map[string]any) string {
 	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 	body, _ := json.Marshal(claims)
 	return hdr + "." + base64.RawURLEncoding.EncodeToString(body) + "."
@@ -151,7 +151,7 @@ func TestValidateToken_TableDriven(t *testing.T) {
 			name:     "alg=none is rejected",
 			audience: audience,
 			makeToken: func(t *testing.T, idp *testIDP) string {
-				return unsignedToken(map[string]interface{}{
+				return unsignedToken(map[string]any{
 					"sub": "attacker",
 					"iss": idp.server.URL,
 					"aud": audience,
@@ -347,7 +347,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 	const issuer = "https://idp.example.com"
 	const audience = "spark"
 
-	mkToken := func(claims map[string]interface{}) string {
+	mkToken := func(claims map[string]any) string {
 		hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
 		body, _ := json.Marshal(claims)
 		return hdr + "." + base64.RawURLEncoding.EncodeToString(body) + ".garbage-signature"
@@ -356,13 +356,13 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 	cases := []struct {
 		name    string
 		cfg     OIDCConfig
-		claims  map[string]interface{}
+		claims  map[string]any
 		wantErr bool
 	}{
 		{
 			name: "valid claims accepted",
 			cfg:  OIDCConfig{SkipValidation: true, IssuerURL: issuer, Audience: audience},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 				"iss": issuer,
 				"aud": audience,
@@ -372,7 +372,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 		{
 			name: "wrong issuer rejected",
 			cfg:  OIDCConfig{SkipValidation: true, IssuerURL: issuer, Audience: audience},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 				"iss": "https://evil.example.com",
 				"aud": audience,
@@ -383,7 +383,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 		{
 			name: "expired token rejected",
 			cfg:  OIDCConfig{SkipValidation: true, IssuerURL: issuer, Audience: audience},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 				"iss": issuer,
 				"aud": audience,
@@ -394,7 +394,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 		{
 			name: "missing exp rejected when issuer configured",
 			cfg:  OIDCConfig{SkipValidation: true, IssuerURL: issuer},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 				"iss": issuer,
 			},
@@ -403,7 +403,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 		{
 			name: "wrong audience rejected",
 			cfg:  OIDCConfig{SkipValidation: true, IssuerURL: issuer, Audience: audience},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 				"iss": issuer,
 				"aud": "other",
@@ -414,7 +414,7 @@ func TestValidateToken_SkipValidationClaimChecks(t *testing.T) {
 		{
 			name: "no checks when nothing configured (pure local dev)",
 			cfg:  OIDCConfig{SkipValidation: true},
-			claims: map[string]interface{}{
+			claims: map[string]any{
 				"sub": "alice",
 			},
 		},

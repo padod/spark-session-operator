@@ -218,7 +218,7 @@ func (a *Authenticator) exchangeROPC(ctx context.Context, username, password str
 	if err != nil {
 		return "", fmt.Errorf("exchange credentials: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
@@ -288,7 +288,7 @@ func (a *Authenticator) parseAndVerify(tokenString string) (*UserInfo, error) {
 
 // keyfunc resolves the JWKS key matching the token's `kid` header and
 // enforces the per-key algorithm declared in the JWKS document.
-func (a *Authenticator) keyfunc(token *jwt.Token) (interface{}, error) {
+func (a *Authenticator) keyfunc(token *jwt.Token) (any, error) {
 	kid, _ := token.Header["kid"].(string)
 	if kid == "" {
 		return nil, fmt.Errorf("token missing kid header")
@@ -386,11 +386,11 @@ func unixClaim(claims jwt.MapClaims, name string) (int64, error) {
 	}
 }
 
-func audienceContains(aud interface{}, want string) bool {
+func audienceContains(aud any, want string) bool {
 	switch v := aud.(type) {
 	case string:
 		return v == want
-	case []interface{}:
+	case []any:
 		for _, a := range v {
 			if s, ok := a.(string); ok && s == want {
 				return true
@@ -420,7 +420,7 @@ func (a *Authenticator) extractUserFromClaims(claims jwt.MapClaims) (*UserInfo, 
 
 	var groups []string
 	if groupsRaw, ok := claims[groupsClaim]; ok {
-		if groupsList, ok := groupsRaw.([]interface{}); ok {
+		if groupsList, ok := groupsRaw.([]any); ok {
 			for _, g := range groupsList {
 				if gs, ok := g.(string); ok {
 					groups = append(groups, gs)

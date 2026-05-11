@@ -21,6 +21,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+// Pool type values — keep as constants so proxy/controller agree.
+const (
+	PoolTypeConnect = "connect"
+	PoolTypeThrift  = "thrift"
+)
+
+// Instance state values (subset of PoolInstanceStatus.State enum).
+const (
+	InstanceStatePending  = "Pending"
+	InstanceStateRunning  = "Running"
+	InstanceStateDraining = "Draining"
+	InstanceStateFailed   = "Failed"
+)
+
+// Scaling metric type values.
+const (
+	ScalingMetricCPU            = "cpu"
+	ScalingMetricMemory         = "memory"
+	ScalingMetricActiveSessions = "activeSessions"
+)
+
 // SparkSessionPoolSpec defines the desired state of a pool of Spark server instances
 type SparkSessionPoolSpec struct {
 	// Type of Spark server: "connect" or "thrift"

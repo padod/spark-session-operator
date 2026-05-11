@@ -115,12 +115,12 @@ func (g *SessionGateway) Start(addr string) error {
 	router.HandleFunc("/api/v1/pools", g.listPools).Methods("GET")
 	router.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	}).Methods("GET")
 
 	router.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	}).Methods("GET")
 
 	g.srv = &http.Server{
@@ -415,10 +415,10 @@ func (g *SessionGateway) sessionToResponse(s *sparkv1alpha1.SparkInteractiveSess
 	return resp
 }
 
-func (g *SessionGateway) writeJSON(w http.ResponseWriter, status int, v interface{}) {
+func (g *SessionGateway) writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(v)
 }
 
 func (g *SessionGateway) writeError(w http.ResponseWriter, status int, errCode, message string) {

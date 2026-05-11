@@ -189,7 +189,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 			Name:      name,
 		}, session); err == nil {
 			switch session.Status.State {
-			case "Active", "Idle", "Pending", "Assigning", "":
+			case sparkv1alpha1.SessionStateActive, sparkv1alpha1.SessionStateIdle, sparkv1alpha1.SessionStatePending, "Assigning", "":
 				p.log.Info("Reusing session (cached)", "name", name, "user", username, "state", session.Status.State)
 				return name, nil
 			}
@@ -212,7 +212,7 @@ func (p *SessionProxy) findOrCreateSession(ctx context.Context, username, poolNa
 
 	for _, s := range sessionList.Items {
 		switch s.Status.State {
-		case "Active", "Idle", "Pending", "Assigning":
+		case sparkv1alpha1.SessionStateActive, sparkv1alpha1.SessionStateIdle, sparkv1alpha1.SessionStatePending, "Assigning":
 			p.log.Info("Reusing session (discovered)", "name", s.Name, "user", username, "state", s.Status.State)
 			p.sessions.set(key, s.Name)
 			return s.Name, nil
@@ -803,14 +803,14 @@ func (p *SessionProxy) dialBackendStream(ctx context.Context, endpoint, fullMeth
 		ClientStreams: true,
 	}, fullMethod, grpc.ForceCodec(rawCodec{}))
 	if err != nil {
-		backendConn.Close()
+		_ = backendConn.Close()
 		return nil, nil, fmt.Errorf("open backend stream %s: %w", fullMethod, err)
 	}
 	return backendConn, backendStream, nil
 }
 
 // handleConnectStream handles a single gRPC stream for Spark Connect.
-func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.ServerStream) error {
+func (p *SessionProxy) handleConnectStream(_ any, serverStream grpc.ServerStream) error {
 	ctx := serverStream.Context()
 
 	userInfo, firstMsg, err := p.authenticateConnect(ctx, serverStream)
@@ -866,7 +866,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 			return status.Errorf(codes.Unavailable, "backend stream failed: %s", describeOrDefault(p.describeBackendFailure(ctx, sessionName), err.Error()))
 		}
 	}
-	defer backendConn.Close()
+	defer func() { _ = backendConn.Close() }()
 
 	p.log.Info("Connect session proxying started", "session", sessionName, "user", userInfo.Username, "endpoint", endpoint, "method", fullMethod)
 
@@ -927,7 +927,7 @@ func (p *SessionProxy) handleConnectStream(_ interface{}, serverStream grpc.Serv
 	}()
 
 	// Wait for either direction to finish
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		if err := <-errCh; err != nil {
 			p.log.V(1).Info("gRPC stream ended", "session", sessionName, "error", err)
 			return truncateStatusError(err)

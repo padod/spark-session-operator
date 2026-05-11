@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
 	"reflect"
 	"strconv"
@@ -57,12 +58,6 @@ const (
 	conditionTypeDegraded = "Degraded"
 )
 
-var sparkAppGVR = schema.GroupVersionResource{
-	Group:    "sparkoperator.k8s.io",
-	Version:  "v1beta2",
-	Resource: "sparkapplications",
-}
-
 // SparkSessionPoolReconciler reconciles a SparkSessionPool object
 type SparkSessionPoolReconciler struct {
 	client.Client
@@ -84,6 +79,7 @@ type SparkSessionPoolReconciler struct {
 
 func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := r.Log.WithValues("pool", req.NamespacedName)
+	ctx = logr.NewContext(ctx, log)
 
 	pool := &sparkv1alpha1.SparkSessionPool{}
 	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
@@ -94,7 +90,7 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if !pool.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, log, pool)
+		return r.handleDeletion(ctx, pool)
 	}
 
 	if !controllerutil.ContainsFinalizer(pool, poolFinalizer) {
@@ -110,7 +106,7 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	// the observable state stuck on the previous reconcile's snapshot.
 	var errs []error
 
-	if err := r.reconcileIngress(ctx, log, pool); err != nil {
+	if err := r.reconcileIngress(ctx, pool); err != nil {
 		log.Error(err, "Failed to reconcile Ingress")
 		errs = append(errs, fmt.Errorf("ingress: %w", err))
 	}
@@ -135,10 +131,10 @@ func (r *SparkSessionPoolReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		instances = r.buildInstanceStatuses(ctx, pool.Namespace, existingApps, sessionCounts)
 		counts = computePoolCounts(instances)
 
-		if err := r.reconcileScaling(ctx, log, pool, instances, counts, pendingSessions, existingApps); err != nil {
+		if err := r.reconcileScaling(ctx, pool, instances, counts, pendingSessions); err != nil {
 			errs = append(errs, fmt.Errorf("scaling: %w", err))
 		}
-		if err := r.reconcileFailedInstances(ctx, log, pool, instances, existingApps); err != nil {
+		if err := r.reconcileFailedInstances(ctx, pool, instances); err != nil {
 			errs = append(errs, fmt.Errorf("failed-instance replacement: %w", err))
 		}
 	}
@@ -223,12 +219,12 @@ func computePoolCounts(instances []sparkv1alpha1.PoolInstanceStatus) poolCounts 
 	var c poolCounts
 	for _, inst := range instances {
 		switch inst.State {
-		case "Running":
+		case sparkv1alpha1.InstanceStateRunning:
 			c.running++
 			c.ready++
-		case "Draining":
+		case sparkv1alpha1.InstanceStateDraining:
 			c.running++
-		case "Pending", "Submitted", "":
+		case sparkv1alpha1.InstanceStatePending, "Submitted", "":
 			c.pending++
 		}
 		c.totalSessions += inst.ActiveSessions
@@ -240,13 +236,12 @@ func computePoolCounts(instances []sparkv1alpha1.PoolInstanceStatus) poolCounts 
 // new instances on scale-up and (respecting cooldown) removing them on scale-down.
 func (r *SparkSessionPoolReconciler) reconcileScaling(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 	instances []sparkv1alpha1.PoolInstanceStatus,
 	counts poolCounts,
 	pendingSessions int32,
-	existingApps []unstructured.Unstructured,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	desired := r.calculateDesiredReplicas(ctx, pool, counts.ready, counts.totalSessions, pendingSessions, instances)
 
 	// Count pending instances toward the total so we don't create duplicates
@@ -255,8 +250,8 @@ func (r *SparkSessionPoolReconciler) reconcileScaling(
 	if currentTotal < desired {
 		toCreate := desired - currentTotal
 		log.Info("Scaling up", "current", counts.running, "pending", counts.pending, "desired", desired, "creating", toCreate, "pendingSessions", pendingSessions)
-		for i := int32(0); i < toCreate; i++ {
-			if err := r.createPoolInstance(ctx, log, pool, existingApps); err != nil {
+		for range toCreate {
+			if err := r.createPoolInstance(ctx, pool); err != nil {
 				log.Error(err, "Failed to create pool instance")
 				return err
 			}
@@ -266,7 +261,7 @@ func (r *SparkSessionPoolReconciler) reconcileScaling(
 	if counts.running > desired && r.canScaleDown(pool) {
 		toRemove := counts.running - desired
 		log.Info("Scaling down", "current", counts.running, "desired", desired, "removing", toRemove)
-		if err := r.scaleDown(ctx, log, pool, instances, toRemove); err != nil {
+		if err := r.scaleDown(ctx, pool, instances, toRemove); err != nil {
 			log.Error(err, "Failed to scale down")
 			return err
 		}
@@ -282,14 +277,13 @@ func (r *SparkSessionPoolReconciler) reconcileScaling(
 // race itself and oversubscribe the pool.
 func (r *SparkSessionPoolReconciler) reconcileFailedInstances(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 	instances []sparkv1alpha1.PoolInstanceStatus,
-	existingApps []unstructured.Unstructured,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	var errs []error
 	for _, inst := range instances {
-		if inst.State != "Failed" {
+		if inst.State != sparkv1alpha1.InstanceStateFailed {
 			continue
 		}
 		log.Info("Replacing failed instance", "instance", inst.Name)
@@ -298,7 +292,7 @@ func (r *SparkSessionPoolReconciler) reconcileFailedInstances(
 			errs = append(errs, fmt.Errorf("delete %s: %w", inst.Name, err))
 			continue
 		}
-		if err := r.createPoolInstance(ctx, log, pool, existingApps); err != nil {
+		if err := r.createPoolInstance(ctx, pool); err != nil {
 			log.Error(err, "Failed to create replacement instance", "for", inst.Name)
 			errs = append(errs, fmt.Errorf("create replacement for %s: %w", inst.Name, err))
 		}
@@ -325,7 +319,7 @@ func (r *SparkSessionPoolReconciler) calculateDesiredReplicas(
 	var desired int32
 
 	switch metricsType {
-	case "cpu", "memory":
+	case sparkv1alpha1.ScalingMetricCPU, sparkv1alpha1.ScalingMetricMemory:
 		target := float64(pool.Spec.Scaling.Metrics.TargetPerInstance)
 		if target <= 0 {
 			target = 80
@@ -395,7 +389,7 @@ func (r *SparkSessionPoolReconciler) getResourceUtilization(
 	var measuredPods int
 
 	for _, inst := range instances {
-		if inst.State != "Running" {
+		if inst.State != sparkv1alpha1.InstanceStateRunning {
 			continue
 		}
 
@@ -472,11 +466,11 @@ func (r *SparkSessionPoolReconciler) canScaleDown(pool *sparkv1alpha1.SparkSessi
 
 func (r *SparkSessionPoolReconciler) scaleDown(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 	instances []sparkv1alpha1.PoolInstanceStatus,
 	count int32,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	// Sort instances by session count ascending — remove least loaded first
 	// If drainBeforeScaleDown, prefer instances with 0 sessions
 	removed := int32(0)
@@ -484,7 +478,7 @@ func (r *SparkSessionPoolReconciler) scaleDown(
 		if removed >= count {
 			break
 		}
-		if inst.State != "Running" {
+		if inst.State != sparkv1alpha1.InstanceStateRunning {
 			continue
 		}
 		if pool.Spec.Scaling.DrainBeforeScaleDown && inst.ActiveSessions > 0 {
@@ -499,7 +493,7 @@ func (r *SparkSessionPoolReconciler) scaleDown(
 		// dangling "Active" session that can never serve traffic. Failure
 		// here is logged but non-fatal — the Watch on SparkApplication from
 		// the session controller is the defense-in-depth backstop.
-		if err := r.markSessionsFailedForInstance(ctx, log, pool.Namespace, inst.Name, "scale-down"); err != nil {
+		if err := r.markSessionsFailedForInstance(ctx, pool.Namespace, inst.Name, "scale-down"); err != nil {
 			log.Error(err, "Failed to mark sessions on removed instance", "instance", inst.Name)
 		}
 		if err := r.deleteSparkApplication(ctx, pool.Namespace, inst.Name); err != nil {
@@ -515,10 +509,9 @@ func (r *SparkSessionPoolReconciler) scaleDown(
 
 func (r *SparkSessionPoolReconciler) createPoolInstance(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
-	existing []unstructured.Unstructured,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	// Generate unique name
 	instanceName := fmt.Sprintf("%s-%d", pool.Name, time.Now().UnixNano()%100000)
 
@@ -543,7 +536,7 @@ func (r *SparkSessionPoolReconciler) createPoolInstance(
 
 	// Copy template spec from raw JSON
 	if pool.Spec.SparkApplicationTemplate.Spec != nil {
-		var specMap map[string]interface{}
+		var specMap map[string]any
 		if err := json.Unmarshal(pool.Spec.SparkApplicationTemplate.Spec.Raw, &specMap); err != nil {
 			return fmt.Errorf("failed to unmarshal template spec: %w", err)
 		}
@@ -603,9 +596,9 @@ func (r *SparkSessionPoolReconciler) countSessionsPerInstance(
 	var pendingSessions int32
 	for _, session := range sessionList.Items {
 		switch session.Status.State {
-		case "Active", "Idle":
+		case sparkv1alpha1.SessionStateActive, sparkv1alpha1.SessionStateIdle:
 			counts[session.Status.AssignedInstance]++
-		case "Pending", "":
+		case sparkv1alpha1.SessionStatePending, "":
 			// Sessions not yet assigned to an instance (scale-from-zero trigger)
 			if session.Status.AssignedInstance == "" {
 				pendingSessions++
@@ -621,7 +614,7 @@ func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
 	apps []unstructured.Unstructured,
 	sessionCounts map[string]int32,
 ) []sparkv1alpha1.PoolInstanceStatus {
-	var statuses []sparkv1alpha1.PoolInstanceStatus
+	statuses := make([]sparkv1alpha1.PoolInstanceStatus, 0, len(apps))
 
 	for _, app := range apps {
 		name := app.GetName()
@@ -629,16 +622,16 @@ func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
 		// Extract SparkApplication state
 		sparkState, _, _ := unstructured.NestedString(app.Object, "status", "applicationState", "state")
 
-		state := "Pending"
+		state := sparkv1alpha1.InstanceStatePending
 		endpoint := ""
 
 		switch sparkState {
 		case "RUNNING":
 			role, _, _ := unstructured.NestedString(app.Object, "metadata", "labels", "sparkinteractive.io/instance-role")
 			if role == "draining" {
-				state = "Draining"
+				state = sparkv1alpha1.InstanceStateDraining
 			} else {
-				state = "Running"
+				state = sparkv1alpha1.InstanceStateRunning
 			}
 			// Look up the driver service by spark-app-selector label.
 			// The spark-operator creates a headless service labeled with
@@ -659,11 +652,11 @@ func (r *SparkSessionPoolReconciler) buildInstanceStatuses(
 				}
 			}
 		case "FAILED", "FAILING":
-			state = "Failed"
+			state = sparkv1alpha1.InstanceStateFailed
 		case "COMPLETED":
-			state = "Failed" // Thrift/Connect servers shouldn't complete
+			state = sparkv1alpha1.InstanceStateFailed // Thrift/Connect servers shouldn't complete
 		case "SUBMITTED", "PENDING_RERUN", "":
-			state = "Pending"
+			state = sparkv1alpha1.InstanceStatePending
 		}
 
 		statuses = append(statuses, sparkv1alpha1.PoolInstanceStatus{
@@ -692,11 +685,10 @@ func (r *SparkSessionPoolReconciler) deleteSparkApplication(ctx context.Context,
 
 func (r *SparkSessionPoolReconciler) handleDeletion(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 ) (ctrl.Result, error) {
+	log := logr.FromContextOrDiscard(ctx)
 	if controllerutil.ContainsFinalizer(pool, poolFinalizer) {
-		// Delete all pool instances
 		apps, err := r.listPoolInstances(ctx, pool)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -712,12 +704,12 @@ func (r *SparkSessionPoolReconciler) handleDeletion(
 		// see a specific reason instead of timing out against a dead pool.
 		// Logged but non-fatal — stuck sessions will eventually hit idle
 		// timeout; we'd rather complete pool teardown than block on it.
-		if err := r.cascadeFailSessionsForPool(ctx, log, pool); err != nil {
+		if err := r.cascadeFailSessionsForPool(ctx, pool); err != nil {
 			log.Error(err, "Failed to cascade session cleanup")
 		}
 
 		// Delete the Ingress created for this pool (cross-namespace, no ownerRef GC)
-		if err := r.deletePoolIngress(ctx, log, pool); err != nil {
+		if err := r.deletePoolIngress(ctx, pool); err != nil {
 			log.Error(err, "Failed to delete pool Ingress")
 		}
 
@@ -735,9 +727,9 @@ func (r *SparkSessionPoolReconciler) handleDeletion(
 // condition. Uses the spec.pool field index registered in SetupWithManager.
 func (r *SparkSessionPoolReconciler) cascadeFailSessionsForPool(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	list := &sparkv1alpha1.SparkInteractiveSessionList{}
 	if err := r.List(ctx, list,
 		client.InNamespace(pool.Namespace),
@@ -749,11 +741,11 @@ func (r *SparkSessionPoolReconciler) cascadeFailSessionsForPool(
 	for i := range list.Items {
 		s := &list.Items[i]
 		switch s.Status.State {
-		case "Failed", "Terminated", "Terminating":
+		case sparkv1alpha1.SessionStateFailed, sparkv1alpha1.SessionStateTerminated, sparkv1alpha1.SessionStateTerminating:
 			continue
 		}
 		log.Info("Marking session Failed because pool is being deleted", "session", s.Name, "pool", pool.Name)
-		s.Status.State = "Failed"
+		s.Status.State = sparkv1alpha1.SessionStateFailed
 		apimeta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
 			Type:    sparkv1alpha1.ConditionPoolDeleted,
 			Status:  metav1.ConditionTrue,
@@ -770,9 +762,9 @@ func (r *SparkSessionPoolReconciler) cascadeFailSessionsForPool(
 // deletePoolIngress deletes the Ingress associated with a pool.
 func (r *SparkSessionPoolReconciler) deletePoolIngress(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	ingressNamespace := r.ProxyNamespace
 	if ingressNamespace == "" {
 		ingressNamespace = pool.Namespace
@@ -780,9 +772,9 @@ func (r *SparkSessionPoolReconciler) deletePoolIngress(
 
 	var suffix string
 	switch pool.Spec.Type {
-	case "connect":
+	case sparkv1alpha1.PoolTypeConnect:
 		suffix = "-connect"
-	case "thrift":
+	case sparkv1alpha1.PoolTypeThrift:
 		suffix = "-thrift"
 	default:
 		return nil
@@ -804,16 +796,16 @@ func (r *SparkSessionPoolReconciler) deletePoolIngress(
 // reconcileIngress creates or updates an Ingress for pools to enable hostname-based routing.
 func (r *SparkSessionPoolReconciler) reconcileIngress(
 	ctx context.Context,
-	log logr.Logger,
 	pool *sparkv1alpha1.SparkSessionPool,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	var ingressSuffix string
 	var backendProtocol string
 	var backendPort int32
 	extraAnnotations := map[string]string{}
 
 	switch pool.Spec.Type {
-	case "connect":
+	case sparkv1alpha1.PoolTypeConnect:
 		ingressSuffix = "-connect"
 		backendProtocol = "GRPC"
 		backendPort = 15002
@@ -826,7 +818,7 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		// client sees as UNAVAILABLE instead of AnalysisException.
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-buffer-size"] = "32k"
 		extraAnnotations["nginx.ingress.kubernetes.io/proxy-buffers-number"] = "8"
-	case "thrift":
+	case sparkv1alpha1.PoolTypeThrift:
 		ingressSuffix = "-thrift"
 		backendProtocol = "HTTP"
 		backendPort = 10009
@@ -852,9 +844,7 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 		"nginx.ingress.kubernetes.io/backend-protocol": backendProtocol,
 		"yandex.cloud/load-balancer-type":              "internal",
 	}
-	for k, v := range extraAnnotations {
-		annotations[k] = v
-	}
+	maps.Copy(annotations, extraAnnotations)
 
 	// Cross-namespace ownerReferences are not allowed, so we use labels to track
 	// which pool owns this Ingress. Cleanup happens in handleDeletion.
@@ -927,15 +917,14 @@ func (r *SparkSessionPoolReconciler) reconcileIngress(
 
 	existing.Spec = desired.Spec
 	// Merge our labels/annotations into existing (preserving any extras added by other controllers)
-	for k, v := range desired.Labels {
-		existing.Labels[k] = v
+	if existing.Labels == nil {
+		existing.Labels = make(map[string]string)
 	}
-	for k, v := range desired.Annotations {
-		if existing.Annotations == nil {
-			existing.Annotations = make(map[string]string)
-		}
-		existing.Annotations[k] = v
+	maps.Copy(existing.Labels, desired.Labels)
+	if existing.Annotations == nil {
+		existing.Annotations = make(map[string]string)
 	}
+	maps.Copy(existing.Annotations, desired.Annotations)
 	log.V(1).Info("Updating Ingress for pool", "ingress", ingressName, "namespace", ingressNamespace, "host", pool.Spec.Host)
 	return r.Update(ctx, existing)
 }
@@ -968,9 +957,9 @@ func (r *SparkSessionPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // aggregated so one stuck update doesn't starve the rest of the cleanup.
 func (r *SparkSessionPoolReconciler) markSessionsFailedForInstance(
 	ctx context.Context,
-	log logr.Logger,
 	namespace, instanceName, cause string,
 ) error {
+	log := logr.FromContextOrDiscard(ctx)
 	list := &sparkv1alpha1.SparkInteractiveSessionList{}
 	if err := r.List(ctx, list, client.InNamespace(namespace)); err != nil {
 		return fmt.Errorf("list sessions for instance %s: %w", instanceName, err)
@@ -982,12 +971,12 @@ func (r *SparkSessionPoolReconciler) markSessionsFailedForInstance(
 			continue
 		}
 		switch s.Status.State {
-		case "Failed", "Terminated", "Terminating":
+		case sparkv1alpha1.SessionStateFailed, sparkv1alpha1.SessionStateTerminated, sparkv1alpha1.SessionStateTerminating:
 			continue
 		}
 		log.Info("Marking session Failed because assigned instance is gone",
 			"session", s.Name, "instance", instanceName, "cause", cause)
-		s.Status.State = "Failed"
+		s.Status.State = sparkv1alpha1.SessionStateFailed
 		apimeta.SetStatusCondition(&s.Status.Conditions, metav1.Condition{
 			Type:    sparkv1alpha1.ConditionInstanceTerminated,
 			Status:  metav1.ConditionTrue,
